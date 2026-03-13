@@ -113,16 +113,16 @@ class Backtester:
                     continue
                 i = idx_map[t]
 
-                # Signal first, then TP/SL
-                if t in signal_timelines[sym]:
-                    sim.process_signal(signal_timelines[sym][t], entry_time=int(t))
-
+                # TP/SL first, then signal — matches dry-run order
                 sim.process_candle(
                     sym,
                     float(indexed[sym]["highs"][i]),
                     float(indexed[sym]["lows"][i]),
                     int(indexed[sym]["close_times"][i]),
                 )
+
+                if t in signal_timelines[sym]:
+                    sim.process_signal(signal_timelines[sym][t], entry_time=int(t))
 
             raw_equity.append({"time": t, "equity": round(sim.wallet.balance, 2)})
 
@@ -220,6 +220,7 @@ class Backtester:
         symbol = str(df["symbol"].iloc[0])
 
         base_times = df["open_time"].values
+        base_closes = df["close"].values
 
         rsi_series = rsi(close, 28)
         atr_series = atr(high, low, close, 50)
@@ -231,15 +232,19 @@ class Backtester:
             close_ma = variant(ma_type, alt_df["close"], ma_period, alma_sigma, alma_offset)
             open_ma = variant(ma_type, alt_df["open"], ma_period, alma_sigma, alma_offset)
             bar_times = alt_df["open_time"].values
-            bar_first_closes = alt_df["first_close"].values
         else:
             close_ma = variant(ma_type, close, ma_period, alma_sigma, alma_offset)
             open_ma = variant(ma_type, open_, ma_period, alma_sigma, alma_offset)
             bar_times = df["open_time"].values
-            bar_first_closes = df["close"].values
 
         close_ma_vals = close_ma.values
         open_ma_vals = open_ma.values
+
+        def _base_close_at(alt_open_time: int) -> float:
+            idx = np.searchsorted(base_times, alt_open_time)
+            if idx < len(base_closes):
+                return float(base_closes[idx])
+            return float(base_closes[-1])
 
         def _indicator_at(series: pd.Series, alt_open_time: int) -> float:
             idx = np.searchsorted(base_times, alt_open_time)
@@ -264,7 +269,7 @@ class Backtester:
             se_trigger = prev_c >= prev_o and curr_c < curr_o
 
             t = int(bar_times[i])
-            entry_price = float(bar_first_closes[i])
+            entry_price = _base_close_at(t)
 
             # Condition updates FIRST (regardless of trade_type), then signal
             # is emitted only if trade_type matches — same as Pine Script
@@ -357,66 +362,13 @@ class Backtester:
         avg_loss = sum(losing) / len(losing) if losing else 0
 
         # Sharpe-like ratio
-        pnls = [t.pnl_usdt for t in trades]
-        if len(pnls) > 1:
+        if len(trades) > 1:
+            pnls = [t.pnl_usdt for t in trades]
             avg_pnl = sum(pnls) / len(pnls)
             std_pnl = (sum((p - avg_pnl) ** 2 for p in pnls) / len(pnls)) ** 0.5
             sharpe = round(avg_pnl / std_pnl, 4) if std_pnl > 0 else 0
         else:
-            avg_pnl = pnls[0] if pnls else 0
             sharpe = 0
-
-        # Sortino ratio (penalizes only downside volatility)
-        if len(pnls) > 1:
-            downside = [min(0, p - avg_pnl) ** 2 for p in pnls]
-            downside_dev = (sum(downside) / len(downside)) ** 0.5
-            sortino = round(avg_pnl / downside_dev, 4) if downside_dev > 0 else 0
-        else:
-            sortino = 0
-
-        # Calmar ratio (annualized return / max drawdown)
-        total_pnl = stats.get("total_pnl", 0)
-        initial_bal = stats.get("initial_balance", 1)
-        if max_dd_pct > 0 and len(eq_values) > 1:
-            calmar = round((total_pnl / initial_bal * 100) / max_dd_pct, 4)
-        else:
-            calmar = 0
-
-        # Recovery factor (net profit / max drawdown)
-        recovery_factor = round(total_pnl / max_dd, 4) if max_dd > 0 else 0
-
-        # Expectancy: (win_rate * avg_win) + (loss_rate * avg_loss)
-        win_rate = stats.get("win_rate", 0) / 100
-        expectancy = round(win_rate * avg_win + (1 - win_rate) * avg_loss, 4) if trades else 0
-
-        # Consecutive wins/losses
-        max_consec_wins = 0
-        max_consec_losses = 0
-        cur_wins = 0
-        cur_losses = 0
-        for t in trades:
-            if t.pnl_usdt > 0:
-                cur_wins += 1
-                cur_losses = 0
-                max_consec_wins = max(max_consec_wins, cur_wins)
-            elif t.pnl_usdt < 0:
-                cur_losses += 1
-                cur_wins = 0
-                max_consec_losses = max(max_consec_losses, cur_losses)
-            else:
-                cur_wins = 0
-                cur_losses = 0
-
-        # Average trade duration (ms → minutes)
-        durations = []
-        for t in trades:
-            if t.entry_time and t.exit_time and t.exit_time > t.entry_time:
-                durations.append(t.exit_time - t.entry_time)
-        avg_duration_min = round(sum(durations) / len(durations) / 60000, 1) if durations else 0
-
-        # Best & worst single trade
-        best_trade_pnl = round(max(pnls), 4) if pnls else 0
-        worst_trade_pnl = round(min(pnls), 4) if pnls else 0
 
         return {
             **stats,
@@ -430,15 +382,6 @@ class Backtester:
             "avg_win": round(avg_win, 4),
             "avg_loss": round(avg_loss, 4),
             "sharpe_ratio": sharpe,
-            "sortino_ratio": sortino,
-            "calmar_ratio": calmar,
-            "recovery_factor": recovery_factor,
-            "expectancy": expectancy,
-            "max_consecutive_wins": max_consec_wins,
-            "max_consecutive_losses": max_consec_losses,
-            "avg_duration_min": avg_duration_min,
-            "best_trade_pnl": best_trade_pnl,
-            "worst_trade_pnl": worst_trade_pnl,
             "total_symbols": len(set(t.symbol for t in trades)),
         }
 
@@ -511,11 +454,7 @@ class Backtester:
             "profit_factor": 0, "max_drawdown_usdt": 0, "max_drawdown_pct": 0,
             "max_runup_usdt": 0, "max_runup_pct": 0,
             "gross_profit": 0, "gross_loss": 0,
-            "avg_win": 0, "avg_loss": 0, "sharpe_ratio": 0,
-            "sortino_ratio": 0, "calmar_ratio": 0, "recovery_factor": 0,
-            "expectancy": 0, "max_consecutive_wins": 0, "max_consecutive_losses": 0,
-            "avg_duration_min": 0, "best_trade_pnl": 0, "worst_trade_pnl": 0,
-            "total_symbols": 0,
+            "avg_win": 0, "avg_loss": 0, "sharpe_ratio": 0, "total_symbols": 0,
         }
 
     @property
