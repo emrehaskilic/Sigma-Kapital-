@@ -133,16 +133,6 @@ class SignalEngine:
         last = df.iloc[-1]
         symbol = str(last.get("symbol", ""))
 
-        # Base close price lookup (for entry price at alt-TF transition)
-        base_times = df["open_time"].values
-        base_closes = df["close"].values
-
-        def _base_close_at(alt_open_time: int) -> float:
-            idx = np.searchsorted(base_times, alt_open_time)
-            if idx < len(base_closes):
-                return float(base_closes[idx])
-            return float(base_closes[-1])
-
         # --- Determine MA series to walk ---
         if self._use_alt and self._alt_mult > 1:
             alt_df = self._resample_ohlc(df, self._alt_mult)
@@ -157,12 +147,14 @@ class SignalEngine:
             open_ma = variant(self._ma_type, alt_df["open"],
                               self._ma_period, self._alma_sigma, self._alma_offset)
             bar_times = alt_df["open_time"].values
+            bar_closes = alt_df["close"].values
         else:
             close_ma = variant(self._ma_type, close, self._ma_period,
                                self._alma_sigma, self._alma_offset)
             open_ma = variant(self._ma_type, open_, self._ma_period,
                               self._alma_sigma, self._alma_offset)
             bar_times = df["open_time"].values
+            bar_closes = df["close"].values
 
         close_ma_vals = close_ma.values
         open_ma_vals = open_ma.values
@@ -187,13 +179,13 @@ class SignalEngine:
 
             if le_trigger and condition <= 0.0:
                 condition = 1.0
-                entry_price = _base_close_at(bar_times[i])
+                entry_price = float(bar_closes[i])
                 entry_time = int(bar_times[i])
                 last_transition_idx = i
 
             elif se_trigger and condition >= 0.0:
                 condition = -1.0
-                entry_price = _base_close_at(bar_times[i])
+                entry_price = float(bar_closes[i])
                 entry_time = int(bar_times[i])
                 last_transition_idx = i
 
@@ -257,12 +249,6 @@ class SignalEngine:
         last = df.iloc[-1]
         symbol = str(last.get("symbol", ""))
 
-        # Build a lookup: alt bar open_time → base candle close at that time
-        # TradingView enters at the base candle's close when the alt-TF signal fires
-        # (lookahead behavior: signal fires at the FIRST base candle of the alt bar)
-        base_times = df["open_time"].values
-        base_closes = df["close"].values
-
         # Determine which MA series to walk
         if self._use_alt and self._alt_mult > 1:
             alt_df = self._resample_ohlc(df, self._alt_mult)
@@ -277,22 +263,17 @@ class SignalEngine:
                               self._ma_period, self._alma_sigma,
                               self._alma_offset)
             bar_times = alt_df["open_time"].values
+            bar_closes = alt_df["close"].values
         else:
             close_ma = variant(self._ma_type, close, self._ma_period,
                                self._alma_sigma, self._alma_offset)
             open_ma = variant(self._ma_type, open_, self._ma_period,
                               self._alma_sigma, self._alma_offset)
             bar_times = df["open_time"].values
+            bar_closes = df["close"].values
 
         close_ma_vals = close_ma.values
         open_ma_vals = open_ma.values
-
-        def _base_close_at(alt_open_time: int) -> float:
-            """Find the base candle close at the alt bar's open time."""
-            idx = np.searchsorted(base_times, alt_open_time)
-            if idx < len(base_closes):
-                return float(base_closes[idx])
-            return float(base_closes[-1])
 
         # Walk through bars chronologically, tracking condition state
         condition = 0.0  # 0=flat, 1=LONG, -1=SHORT
@@ -314,12 +295,12 @@ class SignalEngine:
 
             if le_trigger and condition <= 0.0:
                 condition = 1.0
-                entry_price = _base_close_at(bar_times[i])
+                entry_price = float(bar_closes[i])
                 entry_time = int(bar_times[i])
 
             elif se_trigger and condition >= 0.0:
                 condition = -1.0
-                entry_price = _base_close_at(bar_times[i])
+                entry_price = float(bar_closes[i])
                 entry_time = int(bar_times[i])
 
         # After walking all bars, emit a signal for the active position
