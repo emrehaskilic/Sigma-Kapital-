@@ -1,7 +1,8 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useMemo } from "react";
 import {
   AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer,
   CartesianGrid, BarChart, Bar, ReferenceLine, Cell,
+  ScatterChart, Scatter, ZAxis, LineChart, Line,
 } from "recharts";
 import {
   fetchSymbols, fetchConfig, runBacktest,
@@ -10,6 +11,7 @@ import {
 import type { Config, BacktestResult, BacktestTrade } from "../types";
 import { MetricTile } from "../components/MetricTile";
 import { formatNum, pnlColor } from "../utils";
+import { exportBacktestPdf } from "../utils/exportPdf";
 
 /* ── date formatters ── */
 const fmtDate = (ts: number) => {
@@ -30,6 +32,17 @@ const fmtDateTime = (ts: number) => {
   return `${yy}-${mm}-${dd} ${hh}:${mi}`;
 };
 
+const DAYS_TR = ["Pazar", "Pazartesi", "Sali", "Carsamba", "Persembe", "Cuma", "Cumartesi"];
+const MONTHS_TR = ["Oca", "Sub", "Mar", "Nis", "May", "Haz", "Tem", "Agu", "Eyl", "Eki", "Kas", "Ara"];
+
+/* ── Section wrapper ── */
+const Section = ({ title, children, className = "" }: { title: string; children: React.ReactNode; className?: string }) => (
+  <div className={`bg-[#131d2a]/80 rounded-xl border border-slate-700/20 p-4 ${className}`}>
+    <h2 className="text-sm font-semibold text-slate-300 mb-3">{title}</h2>
+    {children}
+  </div>
+);
+
 export default function BacktestPage() {
   /* ── state ── */
   const [allSymbols, setAllSymbols] = useState<string[]>([]);
@@ -44,6 +57,10 @@ export default function BacktestPage() {
   const [result, setResult] = useState<BacktestResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [tradeFilter, setTradeFilter] = useState<string>("ALL");
+
+  // Backtest history
+  const [history, setHistory] = useState<{ label: string; result: BacktestResult; config: Config }[]>([]);
+  const [compareIdx, setCompareIdx] = useState<number | null>(null);
 
   const pollRef = useRef<number | null>(null);
 
@@ -67,7 +84,14 @@ export default function BacktestPage() {
             setError(s.error);
           } else {
             const r = await fetchBacktestResults();
-            if (r.metrics) setResult(r);
+            if (r.metrics) {
+              setResult(r);
+              // Auto-save to history
+              if (config) {
+                const label = `${new Date().toLocaleString("tr-TR")} — ${selectedSymbols.length} pair, ${lookbackDays}d`;
+                setHistory(prev => [...prev, { label, result: r, config: { ...config } }]);
+              }
+            }
           }
         }
       } catch { /* ignore */ }
@@ -98,6 +122,7 @@ export default function BacktestPage() {
     setError(null);
     setBtStatus("starting");
     setTradeFilter("ALL");
+    setCompareIdx(null);
     await runBacktest(selectedSymbols, lookbackDays, config);
   };
 
@@ -108,6 +133,39 @@ export default function BacktestPage() {
     setProgress(0);
     setBtStatus("idle");
     setTradeFilter("ALL");
+    setCompareIdx(null);
+  };
+
+  /* ── Export to CSV ── */
+  const handleExportCSV = () => {
+    if (!result) return;
+    const headers = ["ID","Symbol","Side","Entry Time","Entry Price","Exit Time","Exit Price","Exit Reason","PnL USDT","PnL %","Fee USDT","Leverage"];
+    const rows = result.trades.map(t => [
+      t.id, t.symbol, t.side,
+      t.entry_time ? fmtDateTime(t.entry_time) : "",
+      t.entry_price, t.exit_time ? fmtDateTime(t.exit_time) : "",
+      t.exit_price, t.exit_reason, t.pnl_usdt, t.pnl_pct, t.fee_usdt, t.leverage,
+    ]);
+    const csv = [headers.join(","), ...rows.map(r => r.join(","))].join("\n");
+    const blob = new Blob([csv], { type: "text/csv" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `backtest_trades_${Date.now()}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  /* ── Export full report as JSON ── */
+  const handleExportJSON = () => {
+    if (!result) return;
+    const blob = new Blob([JSON.stringify(result, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `backtest_report_${Date.now()}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
   };
 
   const filteredSymbols = allSymbols
@@ -116,21 +174,101 @@ export default function BacktestPage() {
 
   const m = result?.metrics;
 
+  /* ── Derived data for new charts ── */
+  const monthlyReturns = useMemo(() => {
+    if (!result?.trades.length) return [];
+    const map = new Map<string, number>();
+    for (const t of result.trades) {
+      if (!t.exit_time) continue;
+      const d = new Date(t.exit_time);
+      const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+      map.set(key, (map.get(key) || 0) + t.pnl_usdt);
+    }
+    return Array.from(map.entries())
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([month, pnl]) => ({ month, pnl: +pnl.toFixed(2) }));
+  }, [result]);
+
+  const pnlDistribution = useMemo(() => {
+    if (!result?.trades.length) return [];
+    const pnls = result.trades.map(t => t.pnl_usdt);
+    const min = Math.min(...pnls);
+    const max = Math.max(...pnls);
+    const range = max - min;
+    if (range === 0) return [{ bin: "0", binCenter: 0, count: pnls.length }];
+    const bucketCount = Math.min(25, Math.max(8, Math.ceil(Math.sqrt(pnls.length))));
+    const step = range / bucketCount;
+    const buckets = Array.from({ length: bucketCount }, (_, i) => ({
+      bin: `${(min + i * step).toFixed(1)}`,
+      binCenter: min + (i + 0.5) * step,
+      count: 0,
+    }));
+    for (const p of pnls) {
+      const idx = Math.min(Math.floor((p - min) / step), bucketCount - 1);
+      buckets[idx].count++;
+    }
+    return buckets;
+  }, [result]);
+
+  const cumulativePnlBySymbol = useMemo(() => {
+    if (!result?.trades.length) return [];
+    const syms = [...new Set(result.trades.map(t => t.symbol))].sort();
+    const sorted = [...result.trades].sort((a, b) => (a.exit_time || 0) - (b.exit_time || 0));
+    const cumMap: Record<string, number> = {};
+    syms.forEach(s => { cumMap[s] = 0; });
+    const points: Record<string, any>[] = [];
+    for (const t of sorted) {
+      cumMap[t.symbol] = (cumMap[t.symbol] || 0) + t.pnl_usdt;
+      const point: any = { time: t.exit_time || t.entry_time };
+      syms.forEach(s => { point[s] = +cumMap[s].toFixed(2); });
+      points.push(point);
+    }
+    return { points, symbols: syms };
+  }, [result]);
+
+  const durationVsPnl = useMemo(() => {
+    if (!result?.trades.length) return [];
+    return result.trades
+      .filter(t => t.entry_time && t.exit_time && t.exit_time > t.entry_time)
+      .map(t => ({
+        duration: +((t.exit_time - t.entry_time) / 60000).toFixed(1),
+        pnl: +t.pnl_usdt.toFixed(4),
+        symbol: t.symbol,
+        side: t.side,
+      }));
+  }, [result]);
+
+  const rollingWinRate = useMemo(() => {
+    if (!result?.trades.length || result.trades.length < 10) return [];
+    const window = Math.min(20, Math.floor(result.trades.length / 2));
+    const points: { idx: number; winRate: number }[] = [];
+    for (let i = window - 1; i < result.trades.length; i++) {
+      const slice = result.trades.slice(i - window + 1, i + 1);
+      const wins = slice.filter(t => t.pnl_usdt > 0).length;
+      points.push({ idx: i + 1, winRate: +(wins / window * 100).toFixed(1) });
+    }
+    return points;
+  }, [result]);
+
   /* ── custom tooltip ── */
   const ChartTooltip = ({ active, payload, label }: any) => {
     if (!active || !payload?.length) return null;
     return (
       <div className="bg-[#0b1217] border border-slate-700/30 rounded-lg px-3 py-2 text-xs">
-        <p className="text-slate-400 mb-1">{fmtDate(label)}</p>
+        <p className="text-slate-400 mb-1">{typeof label === "number" && label > 1e9 ? fmtDate(label) : label}</p>
         {payload.map((p: any) => (
           <p key={p.dataKey} style={{ color: p.color }}>
             {p.name}: {formatNum(p.value, 2)}
-            {p.dataKey.includes("pct") ? "%" : p.dataKey === "equity" ? " USDT" : ""}
+            {p.dataKey.includes("pct") || p.dataKey === "winRate" ? "%" : p.dataKey === "equity" ? " USDT" : ""}
           </p>
         ))}
       </div>
     );
   };
+
+  // Comparison result
+  const cmpResult = compareIdx !== null && history[compareIdx] ? history[compareIdx].result : null;
+  const cm = cmpResult?.metrics;
 
   return (
     <div className="min-h-screen bg-[#0b1217] text-slate-200 p-4 md:p-6">
@@ -329,28 +467,67 @@ export default function BacktestPage() {
           </div>
         )}
 
-        {/* ══ RESULTS ══ */}
+        {/* ══════════════════════════════════════════════════════════════════
+            RESULTS
+        ══════════════════════════════════════════════════════════════════ */}
         {m && (
           <>
-            {/* ── Summary Metrics ── */}
-            <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-3">
-              <MetricTile label="Total PnL" value={`${formatNum(m.total_pnl, 2, true)} USDT`} color={pnlColor(m.total_pnl)} />
-              <MetricTile label="Total PnL %" value={`${formatNum(m.total_pnl_pct, 2, true)}%`} color={pnlColor(m.total_pnl_pct)} />
-              <MetricTile label="Net (- Fees)" value={`${formatNum(m.total_pnl - m.total_fees, 2, true)} USDT`} color={pnlColor(m.total_pnl - m.total_fees)} />
-              <MetricTile label="Bakiye" value={`${formatNum(m.current_balance, 2)} USDT`} color="text-sky-400" />
-              <MetricTile label="Max Drawdown" value={`${formatNum(m.max_drawdown_pct, 2)}%`} color="text-red-400" />
-              <MetricTile label="Profit Factor" value={formatNum(m.profit_factor, 2)} color={m.profit_factor >= 1 ? "text-emerald-400" : "text-red-400"} />
+            {/* ── Export & History Bar ── */}
+            <div className="flex items-center gap-3 flex-wrap">
+              <button onClick={() => result && exportBacktestPdf(result)}
+                className="px-4 py-1.5 rounded-lg text-xs font-semibold bg-blue-500/15 text-blue-400 border border-blue-500/25 hover:bg-blue-500/25 transition-colors">
+                PDF Rapor Indir
+              </button>
+              <button onClick={handleExportCSV}
+                className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 hover:bg-emerald-500/20 transition-colors">
+                CSV Indir
+              </button>
+              <button onClick={handleExportJSON}
+                className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-sky-500/10 text-sky-400 border border-sky-500/20 hover:bg-sky-500/20 transition-colors">
+                JSON Rapor Indir
+              </button>
+              <div className="flex-1" />
+              {history.length > 1 && (
+                <div className="flex items-center gap-2 text-xs">
+                  <span className="text-slate-500">Karsilastir:</span>
+                  <select value={compareIdx ?? ""} onChange={e => setCompareIdx(e.target.value === "" ? null : +e.target.value)}
+                    className="bg-[#0b1217] border border-slate-700/30 rounded-lg px-2 py-1 text-xs text-slate-200">
+                    <option value="">--</option>
+                    {history.slice(0, -1).map((h, i) => (
+                      <option key={i} value={i}>{h.label}</option>
+                    ))}
+                  </select>
+                </div>
+              )}
             </div>
 
+            {/* ── Summary Metrics Row 1 ── */}
             <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-3">
-              <MetricTile label="Toplam Islem" value={m.total_trades} />
+              <MetricTile label="Total PnL" value={`${formatNum(m.total_pnl, 2, true)} USDT`} color={pnlColor(m.total_pnl)}
+                sub={cm ? `vs ${formatNum(cm.total_pnl, 2, true)}` : undefined} />
+              <MetricTile label="Total PnL %" value={`${formatNum(m.total_pnl_pct, 2, true)}%`} color={pnlColor(m.total_pnl_pct)}
+                sub={cm ? `vs ${formatNum(cm.total_pnl_pct, 2, true)}%` : undefined} />
+              <MetricTile label="Net (- Fees)" value={`${formatNum(m.total_pnl - m.total_fees, 2, true)} USDT`} color={pnlColor(m.total_pnl - m.total_fees)} />
+              <MetricTile label="Bakiye" value={`${formatNum(m.current_balance, 2)} USDT`} color="text-sky-400" />
+              <MetricTile label="Max Drawdown" value={`${formatNum(m.max_drawdown_pct, 2)}%`} color="text-red-400"
+                sub={cm ? `vs ${formatNum(cm.max_drawdown_pct, 2)}%` : undefined} />
+              <MetricTile label="Profit Factor" value={formatNum(m.profit_factor, 2)} color={m.profit_factor >= 1 ? "text-emerald-400" : "text-red-400"}
+                sub={cm ? `vs ${formatNum(cm.profit_factor, 2)}` : undefined} />
+            </div>
+
+            {/* ── Summary Metrics Row 2 ── */}
+            <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-3">
+              <MetricTile label="Toplam Islem" value={m.total_trades}
+                sub={cm ? `vs ${cm.total_trades}` : undefined} />
               <MetricTile label="Kazanan" value={m.winning_trades} color="text-emerald-400" />
               <MetricTile label="Kaybeden" value={m.losing_trades} color="text-red-400" />
-              <MetricTile label="Win Rate" value={`${formatNum(m.win_rate, 1)}%`} color={m.win_rate >= 50 ? "text-emerald-400" : "text-red-400"} />
+              <MetricTile label="Win Rate" value={`${formatNum(m.win_rate, 1)}%`} color={m.win_rate >= 50 ? "text-emerald-400" : "text-red-400"}
+                sub={cm ? `vs ${formatNum(cm.win_rate, 1)}%` : undefined} />
               <MetricTile label="Avg Win" value={`${formatNum(m.avg_win, 2)} USDT`} color="text-emerald-400" />
               <MetricTile label="Avg Loss" value={`${formatNum(m.avg_loss, 2)} USDT`} color="text-red-400" />
             </div>
 
+            {/* ── Summary Metrics Row 3 (existing + new) ── */}
             <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-3">
               <MetricTile label="Gross Profit" value={`${formatNum(m.gross_profit, 2)} USDT`} color="text-emerald-400" />
               <MetricTile label="Gross Loss" value={`${formatNum(m.gross_loss, 2)} USDT`} color="text-red-400" />
@@ -360,10 +537,25 @@ export default function BacktestPage() {
               <MetricTile label="Toplam Fee" value={`${formatNum(m.total_fees, 2)} USDT`} color="text-slate-400" />
             </div>
 
+            {/* ── Summary Metrics Row 4 (NEW metrics) ── */}
+            <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-3">
+              <MetricTile label="Sortino Ratio" value={formatNum(m.sortino_ratio, 3)} color={m.sortino_ratio >= 0 ? "text-emerald-400" : "text-red-400"} />
+              <MetricTile label="Calmar Ratio" value={formatNum(m.calmar_ratio, 3)} color={m.calmar_ratio >= 0 ? "text-emerald-400" : "text-red-400"} />
+              <MetricTile label="Recovery Factor" value={formatNum(m.recovery_factor, 2)} color={m.recovery_factor >= 1 ? "text-emerald-400" : "text-red-400"} />
+              <MetricTile label="Expectancy" value={`${formatNum(m.expectancy, 2)} USDT`} color={pnlColor(m.expectancy)} />
+              <MetricTile label="En Iyi Islem" value={`${formatNum(m.best_trade_pnl, 2)} USDT`} color="text-emerald-400" />
+              <MetricTile label="En Kotu Islem" value={`${formatNum(m.worst_trade_pnl, 2)} USDT`} color="text-red-400" />
+            </div>
+
+            <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-3">
+              <MetricTile label="Seri Kazanma" value={m.max_consecutive_wins} color="text-emerald-400" />
+              <MetricTile label="Seri Kaybetme" value={m.max_consecutive_losses} color="text-red-400" />
+              <MetricTile label="Ort. Islem Suresi" value={`${m.avg_duration_min} dk`} color="text-slate-300" />
+            </div>
+
             {/* ── Per-Symbol Metrics ── */}
             {result!.per_symbol && result!.per_symbol.length > 0 && (
-              <div className="bg-[#131d2a]/80 rounded-xl border border-slate-700/20 p-4">
-                <h2 className="text-sm font-semibold text-slate-300 mb-3">Parite Bazinda Sonuclar</h2>
+              <Section title="Parite Bazinda Sonuclar">
                 <div className="overflow-x-auto">
                   <table className="w-full text-xs">
                     <thead>
@@ -414,13 +606,132 @@ export default function BacktestPage() {
                     </tbody>
                   </table>
                 </div>
-              </div>
+              </Section>
             )}
+
+            {/* ── Long vs Short Breakdown ── */}
+            {result!.trades.length > 0 && (() => {
+              const longs = result!.trades.filter(t => t.side === "LONG");
+              const shorts = result!.trades.filter(t => t.side === "SHORT");
+              const calc = (arr: BacktestTrade[]) => {
+                const wins = arr.filter(t => t.pnl_usdt > 0);
+                const losses = arr.filter(t => t.pnl_usdt < 0);
+                const gp = wins.reduce((s, t) => s + t.pnl_usdt, 0);
+                const gl = Math.abs(losses.reduce((s, t) => s + t.pnl_usdt, 0));
+                return {
+                  count: arr.length,
+                  wins: wins.length,
+                  losses: losses.length,
+                  winRate: arr.length ? +(wins.length / arr.length * 100).toFixed(1) : 0,
+                  totalPnl: +arr.reduce((s, t) => s + t.pnl_usdt, 0).toFixed(2),
+                  avgPnl: arr.length ? +(arr.reduce((s, t) => s + t.pnl_usdt, 0) / arr.length).toFixed(2) : 0,
+                  pf: gl > 0 ? +(gp / gl).toFixed(2) : (gp > 0 ? 999.99 : 0),
+                };
+              };
+              const ld = calc(longs);
+              const sd = calc(shorts);
+
+              return (
+                <Section title="Long vs Short Analizi">
+                  <div className="grid grid-cols-2 gap-4">
+                    {[
+                      { label: "LONG", data: ld, color: "emerald" },
+                      { label: "SHORT", data: sd, color: "red" },
+                    ].map(({ label, data, color }) => (
+                      <div key={label} className={`bg-[#0b1217]/60 rounded-lg p-3 border-l-2 border-${color}-400/40`}>
+                        <div className="flex items-center gap-2 mb-2">
+                          <span className={`text-sm font-bold text-${color}-400`}>{label}</span>
+                          <span className="text-[10px] text-slate-500">{data.count} islem</span>
+                        </div>
+                        <div className="grid grid-cols-3 gap-2 text-xs">
+                          <div>
+                            <div className="text-[10px] text-slate-500 uppercase">Win Rate</div>
+                            <div className={data.winRate >= 50 ? `text-emerald-400` : `text-red-400`}>{data.winRate}%</div>
+                          </div>
+                          <div>
+                            <div className="text-[10px] text-slate-500 uppercase">Toplam PnL</div>
+                            <div className={pnlColor(data.totalPnl)}>{formatNum(data.totalPnl, 2, true)} USDT</div>
+                          </div>
+                          <div>
+                            <div className="text-[10px] text-slate-500 uppercase">Ort PnL</div>
+                            <div className={pnlColor(data.avgPnl)}>{formatNum(data.avgPnl, 2, true)} USDT</div>
+                          </div>
+                          <div>
+                            <div className="text-[10px] text-slate-500 uppercase">Kazanan</div>
+                            <div className="text-emerald-400">{data.wins}</div>
+                          </div>
+                          <div>
+                            <div className="text-[10px] text-slate-500 uppercase">Kaybeden</div>
+                            <div className="text-red-400">{data.losses}</div>
+                          </div>
+                          <div>
+                            <div className="text-[10px] text-slate-500 uppercase">Profit Factor</div>
+                            <div className={data.pf >= 1 ? "text-emerald-400" : "text-red-400"}>{data.pf}</div>
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </Section>
+              );
+            })()}
+
+            {/* ── Exit Reason Summary ── */}
+            {result!.trades.length > 0 && (() => {
+              const reasons = [...new Set(result!.trades.map(t => t.exit_reason))].sort();
+              const data = reasons.map(reason => {
+                const trades = result!.trades.filter(t => t.exit_reason === reason);
+                const totalPnl = trades.reduce((s, t) => s + t.pnl_usdt, 0);
+                return {
+                  reason,
+                  count: trades.length,
+                  pct: +(trades.length / result!.trades.length * 100).toFixed(1),
+                  totalPnl: +totalPnl.toFixed(2),
+                  avgPnl: +(totalPnl / trades.length).toFixed(2),
+                  winRate: +(trades.filter(t => t.pnl_usdt > 0).length / trades.length * 100).toFixed(1),
+                };
+              });
+              return (
+                <Section title="Cikis Nedeni Analizi">
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-xs">
+                      <thead>
+                        <tr className="text-[10px] uppercase tracking-wider text-slate-500 border-b border-slate-700/20">
+                          <th className="text-left py-2 px-2">Neden</th>
+                          <th className="text-right py-2 px-2">Islem</th>
+                          <th className="text-right py-2 px-2">Oran</th>
+                          <th className="text-right py-2 px-2">Win Rate</th>
+                          <th className="text-right py-2 px-2">Toplam PnL</th>
+                          <th className="text-right py-2 px-2">Ort PnL</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {data.map(r => (
+                          <tr key={r.reason} className="border-b border-slate-700/10">
+                            <td className="py-1.5 px-2">
+                              <span className={`px-1.5 py-0.5 rounded text-[10px] font-semibold ${
+                                r.reason.startsWith("TP") ? "bg-emerald-400/10 text-emerald-300" :
+                                r.reason === "SL" ? "bg-red-400/10 text-red-300" :
+                                "bg-yellow-400/10 text-yellow-300"
+                              }`}>{r.reason}</span>
+                            </td>
+                            <td className="py-1.5 px-2 text-right">{r.count}</td>
+                            <td className="py-1.5 px-2 text-right text-slate-400">{r.pct}%</td>
+                            <td className={`py-1.5 px-2 text-right ${r.winRate >= 50 ? "text-emerald-400" : "text-red-400"}`}>{r.winRate}%</td>
+                            <td className={`py-1.5 px-2 text-right font-mono ${pnlColor(r.totalPnl)}`}>{formatNum(r.totalPnl, 2, true)}</td>
+                            <td className={`py-1.5 px-2 text-right font-mono ${pnlColor(r.avgPnl)}`}>{formatNum(r.avgPnl, 2, true)}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </Section>
+              );
+            })()}
 
             {/* ── Equity Curve Chart ── */}
             {result!.equity_curve.length > 0 && (
-              <div className="bg-[#131d2a]/80 rounded-xl border border-slate-700/20 p-4">
-                <h2 className="text-sm font-semibold text-slate-300 mb-3">Equity Curve</h2>
+              <Section title="Equity Curve">
                 <ResponsiveContainer width="100%" height={300}>
                   <AreaChart data={result!.equity_curve}>
                     <defs>
@@ -439,13 +750,12 @@ export default function BacktestPage() {
                       stroke="#10b981" fill="url(#eqGrad)" strokeWidth={1.5} dot={false} />
                   </AreaChart>
                 </ResponsiveContainer>
-              </div>
+              </Section>
             )}
 
             {/* ── Drawdown & Run-up Chart ── */}
             {result!.drawdown_curve.length > 0 && (
-              <div className="bg-[#131d2a]/80 rounded-xl border border-slate-700/20 p-4">
-                <h2 className="text-sm font-semibold text-slate-300 mb-3">Run-up & Drawdown (%)</h2>
+              <Section title="Run-up & Drawdown (%)">
                 <ResponsiveContainer width="100%" height={250}>
                   <AreaChart data={result!.drawdown_curve}>
                     <defs>
@@ -471,13 +781,144 @@ export default function BacktestPage() {
                       stroke="#ef4444" fill="url(#ddGrad)" strokeWidth={1} dot={false} />
                   </AreaChart>
                 </ResponsiveContainer>
-              </div>
+              </Section>
+            )}
+
+            {/* ── Monthly Returns Heatmap ── */}
+            {monthlyReturns.length > 0 && (
+              <Section title="Aylik Getiri">
+                <div className="flex flex-wrap gap-2">
+                  {monthlyReturns.map(({ month, pnl }) => {
+                    const intensity = Math.min(Math.abs(pnl) / (Math.max(...monthlyReturns.map(r => Math.abs(r.pnl))) || 1), 1);
+                    const bg = pnl >= 0
+                      ? `rgba(16, 185, 129, ${0.1 + intensity * 0.5})`
+                      : `rgba(239, 68, 68, ${0.1 + intensity * 0.5})`;
+                    const [y, mo] = month.split("-");
+                    return (
+                      <div key={month} className="rounded-lg p-3 text-center min-w-[80px] border border-slate-700/20"
+                        style={{ backgroundColor: bg }}>
+                        <div className="text-[10px] text-slate-400 mb-1">{MONTHS_TR[+mo - 1]} {y}</div>
+                        <div className={`text-sm font-mono font-semibold ${pnl >= 0 ? "text-emerald-300" : "text-red-300"}`}>
+                          {formatNum(pnl, 2, true)}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </Section>
+            )}
+
+            {/* ── PnL Distribution Histogram ── */}
+            {pnlDistribution.length > 0 && (
+              <Section title="PnL Dagilimi (Histogram)">
+                <ResponsiveContainer width="100%" height={200}>
+                  <BarChart data={pnlDistribution}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" />
+                    <XAxis dataKey="bin" tick={{ fontSize: 9, fill: "#64748b" }} interval="preserveStartEnd" />
+                    <YAxis tick={{ fontSize: 10, fill: "#64748b" }} />
+                    <Tooltip content={({ active, payload }: any) => {
+                      if (!active || !payload?.length) return null;
+                      const d = payload[0].payload;
+                      return (
+                        <div className="bg-[#0b1217] border border-slate-700/30 rounded-lg px-3 py-2 text-xs">
+                          <p className="text-slate-400">Aralik: {d.bin} USDT</p>
+                          <p className="text-slate-200">{d.count} islem</p>
+                        </div>
+                      );
+                    }} />
+                    <Bar dataKey="count" name="Islem Sayisi">
+                      {pnlDistribution.map((d, i) => (
+                        <Cell key={i} fill={d.binCenter >= 0 ? "#10b981" : "#ef4444"} fillOpacity={0.7} />
+                      ))}
+                    </Bar>
+                  </BarChart>
+                </ResponsiveContainer>
+              </Section>
+            )}
+
+            {/* ── Cumulative PnL by Symbol ── */}
+            {cumulativePnlBySymbol && "points" in cumulativePnlBySymbol && cumulativePnlBySymbol.points.length > 0 && (
+              <Section title="Kumulatif PnL (Parite Bazinda)">
+                <ResponsiveContainer width="100%" height={300}>
+                  <LineChart data={cumulativePnlBySymbol.points}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" />
+                    <XAxis dataKey="time" tickFormatter={fmtDate} tick={{ fontSize: 10, fill: "#64748b" }}
+                      interval="preserveStartEnd" minTickGap={60} />
+                    <YAxis tick={{ fontSize: 10, fill: "#64748b" }}
+                      tickFormatter={(v: number) => `${v.toFixed(0)}`} />
+                    <Tooltip content={<ChartTooltip />} />
+                    <ReferenceLine y={0} stroke="#334155" strokeWidth={1} />
+                    {cumulativePnlBySymbol.symbols.map((sym, i) => {
+                      const colors = ["#10b981", "#ef4444", "#3b82f6", "#f59e0b", "#8b5cf6", "#ec4899", "#06b6d4", "#84cc16"];
+                      return (
+                        <Line key={sym} type="monotone" dataKey={sym} name={sym}
+                          stroke={colors[i % colors.length]} strokeWidth={1.5} dot={false} />
+                      );
+                    })}
+                  </LineChart>
+                </ResponsiveContainer>
+              </Section>
+            )}
+
+            {/* ── Trade Duration vs PnL Scatter ── */}
+            {durationVsPnl.length > 0 && (
+              <Section title="Islem Suresi vs PnL">
+                <ResponsiveContainer width="100%" height={250}>
+                  <ScatterChart>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" />
+                    <XAxis dataKey="duration" name="Sure (dk)" tick={{ fontSize: 10, fill: "#64748b" }}
+                      tickFormatter={(v: number) => `${v}dk`} />
+                    <YAxis dataKey="pnl" name="PnL" tick={{ fontSize: 10, fill: "#64748b" }}
+                      tickFormatter={(v: number) => `${v.toFixed(1)}`} />
+                    <ZAxis range={[20, 20]} />
+                    <Tooltip content={({ active, payload }: any) => {
+                      if (!active || !payload?.length) return null;
+                      const d = payload[0].payload;
+                      return (
+                        <div className="bg-[#0b1217] border border-slate-700/30 rounded-lg px-3 py-2 text-xs">
+                          <p className="font-semibold">{d.symbol} ({d.side})</p>
+                          <p className="text-slate-400">Sure: {d.duration} dk</p>
+                          <p className={d.pnl >= 0 ? "text-emerald-400" : "text-red-400"}>PnL: {formatNum(d.pnl, 4, true)} USDT</p>
+                        </div>
+                      );
+                    }} />
+                    <ReferenceLine y={0} stroke="#334155" strokeWidth={1} />
+                    <Scatter data={durationVsPnl.filter(d => d.pnl >= 0)} fill="#10b981" fillOpacity={0.6} />
+                    <Scatter data={durationVsPnl.filter(d => d.pnl < 0)} fill="#ef4444" fillOpacity={0.6} />
+                  </ScatterChart>
+                </ResponsiveContainer>
+              </Section>
+            )}
+
+            {/* ── Rolling Win Rate ── */}
+            {rollingWinRate.length > 0 && (
+              <Section title={`Rolling Win Rate (Son ${Math.min(20, Math.floor((result?.trades.length || 0) / 2))} Islem)`}>
+                <ResponsiveContainer width="100%" height={200}>
+                  <LineChart data={rollingWinRate}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" />
+                    <XAxis dataKey="idx" tick={{ fontSize: 10, fill: "#64748b" }} />
+                    <YAxis tick={{ fontSize: 10, fill: "#64748b" }} domain={[0, 100]}
+                      tickFormatter={(v: number) => `${v}%`} />
+                    <Tooltip content={({ active, payload }: any) => {
+                      if (!active || !payload?.length) return null;
+                      return (
+                        <div className="bg-[#0b1217] border border-slate-700/30 rounded-lg px-3 py-2 text-xs">
+                          <p className="text-slate-400">Islem #{payload[0].payload.idx}</p>
+                          <p className="text-sky-400">Win Rate: {payload[0].value}%</p>
+                        </div>
+                      );
+                    }} />
+                    <ReferenceLine y={50} stroke="#334155" strokeWidth={1} strokeDasharray="5 5" />
+                    <Line type="monotone" dataKey="winRate" name="Win Rate %"
+                      stroke="#38bdf8" strokeWidth={1.5} dot={false} />
+                  </LineChart>
+                </ResponsiveContainer>
+              </Section>
             )}
 
             {/* ── Per-Trade PnL Chart ── */}
             {result!.trades.length > 0 && (
-              <div className="bg-[#131d2a]/80 rounded-xl border border-slate-700/20 p-4">
-                <h2 className="text-sm font-semibold text-slate-300 mb-3">Islem Bazinda PnL (USDT)</h2>
+              <Section title="Islem Bazinda PnL (USDT)">
                 <ResponsiveContainer width="100%" height={200}>
                   <BarChart data={result!.trades}>
                     <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" />
@@ -507,7 +948,7 @@ export default function BacktestPage() {
                     </Bar>
                   </BarChart>
                 </ResponsiveContainer>
-              </div>
+              </Section>
             )}
 
             {/* ── Trade Table ── */}
@@ -515,9 +956,8 @@ export default function BacktestPage() {
               const uniqueSyms = [...new Set(result!.trades.map(t => t.symbol))].sort();
               const filtered = tradeFilter === "ALL" ? result!.trades : result!.trades.filter(t => t.symbol === tradeFilter);
               return (
-              <div className="bg-[#131d2a]/80 rounded-xl border border-slate-700/20 p-4">
+              <Section title={`Islem Listesi (${filtered.length})`}>
                 <div className="flex items-center gap-3 mb-3">
-                  <h2 className="text-sm font-semibold text-slate-300">Islem Listesi ({filtered.length})</h2>
                   <select value={tradeFilter} onChange={(e) => setTradeFilter(e.target.value)}
                     className="bg-[#0b1217] border border-slate-700/30 rounded-lg px-2 py-1 text-xs text-slate-200">
                     <option value="ALL">Tum Pairler</option>
@@ -580,7 +1020,85 @@ export default function BacktestPage() {
                     </tbody>
                   </table>
                 </div>
-              </div>
+              </Section>
+              );
+            })()}
+
+            {/* ── Day-of-Week Performance ── */}
+            {result!.trades.length > 0 && (() => {
+              const dayMap = new Map<number, { trades: number; pnl: number; wins: number; losses: number }>();
+              for (let d = 0; d < 7; d++) dayMap.set(d, { trades: 0, pnl: 0, wins: 0, losses: 0 });
+
+              for (const t of result!.trades) {
+                if (!t.entry_time) continue;
+                const day = new Date(t.entry_time).getUTCDay();
+                const stat = dayMap.get(day)!;
+                stat.trades++;
+                stat.pnl += t.pnl_usdt;
+                if (t.pnl_usdt > 0) stat.wins++;
+                else stat.losses++;
+              }
+
+              const days = Array.from(dayMap.entries())
+                .map(([d, s]) => ({ day: d, dayName: DAYS_TR[d], ...s }))
+                .filter(d => d.trades > 0)
+                .sort((a, b) => a.day - b.day);
+
+              const bestDay = [...days].sort((a, b) => b.pnl - a.pnl)[0];
+              const worstDay = [...days].sort((a, b) => a.pnl - b.pnl)[0];
+
+              return (
+                <Section title="Gun Bazli Performans (UTC)">
+                  <div className="flex items-center gap-3 mb-3 text-[10px]">
+                    {bestDay && (
+                      <span className="text-emerald-400 bg-emerald-400/10 px-2 py-0.5 rounded">
+                        En Iyi: {bestDay.dayName} ({formatNum(bestDay.pnl, 2, true)} USDT)
+                      </span>
+                    )}
+                    {worstDay && (
+                      <span className="text-red-400 bg-red-400/10 px-2 py-0.5 rounded">
+                        En Kotu: {worstDay.dayName} ({formatNum(worstDay.pnl, 2, true)} USDT)
+                      </span>
+                    )}
+                  </div>
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-xs">
+                      <thead>
+                        <tr className="text-[10px] uppercase tracking-wider text-slate-500 border-b border-slate-700/20">
+                          <th className="text-left py-2 px-2">Gun</th>
+                          <th className="text-right py-2 px-2">Islem</th>
+                          <th className="text-right py-2 px-2">Kazanan</th>
+                          <th className="text-right py-2 px-2">Kaybeden</th>
+                          <th className="text-right py-2 px-2">Win Rate</th>
+                          <th className="text-right py-2 px-2">Toplam PnL</th>
+                          <th className="text-right py-2 px-2">Ort PnL</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {days.map(d => (
+                          <tr key={d.day} className={`border-b border-slate-700/10 ${
+                            d.day === bestDay?.day ? "bg-emerald-400/5" :
+                            d.day === worstDay?.day ? "bg-red-400/5" : ""
+                          }`}>
+                            <td className="py-1.5 px-2 font-semibold">{d.dayName}</td>
+                            <td className="py-1.5 px-2 text-right">{d.trades}</td>
+                            <td className="py-1.5 px-2 text-right text-emerald-400">{d.wins}</td>
+                            <td className="py-1.5 px-2 text-right text-red-400">{d.losses}</td>
+                            <td className={`py-1.5 px-2 text-right ${d.trades > 0 && (d.wins / d.trades * 100) >= 50 ? "text-emerald-400" : "text-red-400"}`}>
+                              {d.trades > 0 ? formatNum(d.wins / d.trades * 100, 1) : "0.0"}%
+                            </td>
+                            <td className={`py-1.5 px-2 text-right font-mono ${pnlColor(d.pnl)}`}>
+                              {formatNum(d.pnl, 2, true)}
+                            </td>
+                            <td className={`py-1.5 px-2 text-right font-mono ${pnlColor(d.pnl / d.trades)}`}>
+                              {formatNum(d.pnl / d.trades, 2, true)}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </Section>
               );
             })()}
 
@@ -620,8 +1138,7 @@ export default function BacktestPage() {
               });
 
               return (
-              <div className="bg-[#131d2a]/80 rounded-xl border border-slate-700/20 p-4">
-                <h2 className="text-sm font-semibold text-slate-300 mb-3">Saat Bazli Performans Analizi (UTC)</h2>
+              <Section title="Saat Bazli Performans Analizi (UTC)">
                 <div className="space-y-4">
                   {analysisData.map(({ symbol, hours, bestHour, worstHour }) => (
                     <div key={symbol} className="bg-[#0b1217]/60 rounded-lg p-3">
@@ -676,9 +1193,49 @@ export default function BacktestPage() {
                     </div>
                   ))}
                 </div>
-              </div>
+              </Section>
               );
             })()}
+
+            {/* ── Backtest History ── */}
+            {history.length > 0 && (
+              <Section title={`Backtest Gecmisi (${history.length})`}>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-xs">
+                    <thead>
+                      <tr className="text-[10px] uppercase tracking-wider text-slate-500 border-b border-slate-700/20">
+                        <th className="text-left py-2 px-2">#</th>
+                        <th className="text-left py-2 px-2">Tarih</th>
+                        <th className="text-right py-2 px-2">Islem</th>
+                        <th className="text-right py-2 px-2">Win Rate</th>
+                        <th className="text-right py-2 px-2">PnL</th>
+                        <th className="text-right py-2 px-2">PF</th>
+                        <th className="text-right py-2 px-2">Sharpe</th>
+                        <th className="text-right py-2 px-2">Max DD</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {history.map((h, i) => {
+                        const hm = h.result.metrics;
+                        const isCurrent = i === history.length - 1;
+                        return (
+                          <tr key={i} className={`border-b border-slate-700/10 ${isCurrent ? "bg-sky-400/5" : "hover:bg-slate-700/10"}`}>
+                            <td className="py-1.5 px-2 text-slate-500">{i + 1}</td>
+                            <td className="py-1.5 px-2">{h.label} {isCurrent && <span className="text-sky-400 text-[10px]">(mevcut)</span>}</td>
+                            <td className="py-1.5 px-2 text-right">{hm.total_trades}</td>
+                            <td className={`py-1.5 px-2 text-right ${hm.win_rate >= 50 ? "text-emerald-400" : "text-red-400"}`}>{formatNum(hm.win_rate, 1)}%</td>
+                            <td className={`py-1.5 px-2 text-right font-mono ${pnlColor(hm.total_pnl)}`}>{formatNum(hm.total_pnl, 2, true)}</td>
+                            <td className={`py-1.5 px-2 text-right ${hm.profit_factor >= 1 ? "text-emerald-400" : "text-red-400"}`}>{formatNum(hm.profit_factor, 2)}</td>
+                            <td className="py-1.5 px-2 text-right">{formatNum(hm.sharpe_ratio, 3)}</td>
+                            <td className="py-1.5 px-2 text-right text-red-400">{formatNum(hm.max_drawdown_pct, 2)}%</td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </Section>
+            )}
           </>
         )}
 

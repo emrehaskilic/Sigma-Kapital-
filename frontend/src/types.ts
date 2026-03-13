@@ -157,6 +157,15 @@ export interface BacktestMetrics {
   avg_win: number;
   avg_loss: number;
   sharpe_ratio: number;
+  sortino_ratio: number;
+  calmar_ratio: number;
+  recovery_factor: number;
+  expectancy: number;
+  max_consecutive_wins: number;
+  max_consecutive_losses: number;
+  avg_duration_min: number;
+  best_trade_pnl: number;
+  worst_trade_pnl: number;
   total_symbols: number;
 }
 
