@@ -8,7 +8,7 @@ interface Props {
 export function PositionTable({ positions }: Props) {
   if (positions.length === 0) {
     return (
-      <div className="text-zinc-500 text-sm p-4 text-center">
+      <div className="text-slate-500 text-sm p-4 text-center">
         Acik pozisyon yok
       </div>
     );
@@ -18,7 +18,7 @@ export function PositionTable({ positions }: Props) {
     <div className="overflow-x-auto">
       <table className="w-full text-xs">
         <thead>
-          <tr className="text-[10px] uppercase tracking-wider text-zinc-500 border-b border-zinc-700/50">
+          <tr className="text-[10px] uppercase tracking-wider text-slate-500 border-b border-slate-700/20">
             <th className="text-left py-2 px-2">Symbol</th>
             <th className="text-center py-2">Side</th>
             <th className="text-right py-2 px-2">Entry</th>
@@ -43,15 +43,15 @@ export function PositionTable({ positions }: Props) {
           {positions.map((p) => (
             <tr
               key={p.symbol}
-              className="border-b border-zinc-800/50 hover:bg-zinc-800/30 transition-colors"
+              className="border-b border-slate-700/10 hover:bg-slate-700/10 transition-colors"
             >
-              <td className="py-2 px-2 font-semibold text-zinc-200">{p.symbol}</td>
+              <td className="py-2 px-2 font-semibold text-slate-200">{p.symbol}</td>
               <td className="py-2 text-center">
                 <span
                   className={`px-2 py-0.5 rounded text-[10px] font-semibold ${
                     p.side === "LONG"
-                      ? "bg-emerald-400/20 text-emerald-400"
-                      : "bg-red-400/20 text-red-400"
+                      ? "bg-emerald-400/15 text-emerald-400"
+                      : "bg-red-400/15 text-red-400"
                   }`}
                 >
                   {p.side}
@@ -60,13 +60,13 @@ export function PositionTable({ positions }: Props) {
               <td className="py-2 px-2 text-right font-mono">{formatNum(p.entry_price, 4)}</td>
               <td className="py-2 px-2 text-right font-mono text-emerald-400/70">{formatNum(p.bid, 4)}</td>
               <td className="py-2 px-2 text-right font-mono text-red-400/70">{formatNum(p.ask, 4)}</td>
-              <td className="py-2 px-2 text-right font-mono text-zinc-500">{formatNum(p.spread, 6)}</td>
-              <td className="py-2 px-2 text-right font-mono text-zinc-300">{formatNum(p.mark_price, 4)}</td>
+              <td className="py-2 px-2 text-right font-mono text-slate-500">{formatNum(p.spread, 6)}</td>
+              <td className="py-2 px-2 text-right font-mono text-slate-300">{formatNum(p.mark_price, 4)}</td>
               <td className="py-2 px-2 text-right font-mono text-amber-400">{formatNum(p.break_even, 4)}</td>
-              <td className="py-2 px-2 text-right font-mono text-blue-400">{formatNum(p.notional_usdt, 2)}</td>
-              <td className="py-2 px-2 text-right font-mono text-zinc-400">{formatNum(p.tp1, 4)}</td>
-              <td className="py-2 px-2 text-right font-mono text-zinc-400">{formatNum(p.tp2, 4)}</td>
-              <td className="py-2 px-2 text-right font-mono text-zinc-400">{formatNum(p.tp3, 4)}</td>
+              <td className="py-2 px-2 text-right font-mono text-sky-400">{formatNum(p.notional_usdt, 2)}</td>
+              <td className="py-2 px-2 text-right font-mono text-slate-400">{formatNum(p.tp1, 4)}</td>
+              <td className="py-2 px-2 text-right font-mono text-slate-400">{formatNum(p.tp2, 4)}</td>
+              <td className="py-2 px-2 text-right font-mono text-slate-400">{formatNum(p.tp3, 4)}</td>
               <td className="py-2 px-2 text-right font-mono text-red-400">{formatNum(p.sl, 4)}</td>
               <td className={`py-2 px-2 text-right font-mono font-semibold ${pnlColor(p.unrealized_pnl_usdt)}`}>
                 {formatNum(p.unrealized_pnl_usdt, 4, true)}
@@ -80,7 +80,7 @@ export function PositionTable({ positions }: Props) {
               <td className={`py-2 px-2 text-right font-mono font-semibold ${pnlColor(p.total_pnl_usdt)}`}>
                 {formatNum(p.total_pnl_usdt, 4, true)}
               </td>
-              <td className="py-2 px-2 text-right font-mono text-zinc-500">
+              <td className="py-2 px-2 text-right font-mono text-slate-500">
                 {formatNum(p.fees_usdt, 4)}
               </td>
             </tr>

@@ -115,7 +115,7 @@ class Backtester:
 
                 # Signal first, then TP/SL
                 if t in signal_timelines[sym]:
-                    sim.process_signal(signal_timelines[sym][t])
+                    sim.process_signal(signal_timelines[sym][t], entry_time=int(t))
 
                 sim.process_candle(
                     sym,
@@ -422,6 +422,8 @@ class Backtester:
             "pnl_pct": t.pnl_percent,
             "fee_usdt": t.fee_usdt,
             "leverage": t.leverage,
+            "entry_time": t.entry_time,
+            "exit_time": t.exit_time,
         }
 
     @staticmethod

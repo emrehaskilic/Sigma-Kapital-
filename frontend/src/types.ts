@@ -182,6 +182,8 @@ export interface BacktestTrade {
   pnl_pct: number;
   fee_usdt: number;
   leverage: number;
+  entry_time: number;
+  exit_time: number;
 }
 
 export interface PerSymbolMetrics {

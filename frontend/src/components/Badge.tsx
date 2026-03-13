@@ -4,12 +4,12 @@ interface BadgeProps {
 }
 
 const STYLES: Record<string, string> = {
-  "WS LIVE": "bg-emerald-400/20 text-emerald-400 border-emerald-400/30",
-  LIVE: "bg-emerald-400/20 text-emerald-400 border-emerald-400/30",
-  REST: "bg-yellow-400/20 text-yellow-400 border-yellow-400/30",
-  STALE: "bg-red-400/20 text-red-400 border-red-400/30",
-  CONNECTING: "bg-amber-400/20 text-amber-400 border-amber-400/30",
-  DISCONNECTED: "bg-zinc-500/20 text-zinc-500 border-zinc-500/30",
+  "WS LIVE": "bg-emerald-400/15 text-emerald-400 border-emerald-400/25",
+  LIVE: "bg-emerald-400/15 text-emerald-400 border-emerald-400/25",
+  REST: "bg-yellow-400/15 text-yellow-400 border-yellow-400/25",
+  STALE: "bg-red-400/15 text-red-400 border-red-400/25",
+  CONNECTING: "bg-amber-400/15 text-amber-400 border-amber-400/25",
+  DISCONNECTED: "bg-slate-500/15 text-slate-500 border-slate-500/25",
 };
 
 export function Badge({ status, label }: BadgeProps) {
@@ -23,7 +23,7 @@ export function Badge({ status, label }: BadgeProps) {
           status === "REST" ? "bg-yellow-400 animate-pulse" :
           status === "STALE" ? "bg-red-400" :
           status === "CONNECTING" ? "bg-amber-400 animate-pulse" :
-          "bg-zinc-500"
+          "bg-slate-500"
         }`}
       />
       {label || status}

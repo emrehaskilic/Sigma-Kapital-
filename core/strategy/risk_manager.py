@@ -43,6 +43,7 @@ class PositionState:
     tp3_line: float = 0.0
     sl_line: float = 0.0
     remaining_qty: float = 1.0    # fraction of original position
+    entry_time: int = 0           # entry timestamp (ms)
 
 
 class RiskManager:

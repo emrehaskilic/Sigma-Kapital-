@@ -78,7 +78,7 @@ class Simulator:
     def has_position(self, symbol: str) -> bool:
         return symbol in self._positions and self._positions[symbol].condition != 0.0
 
-    def process_signal(self, signal: Signal) -> list[Trade]:
+    def process_signal(self, signal: Signal, entry_time: int = 0) -> list[Trade]:
         """Handle a new entry signal.
 
         Pine Script reversal logic:
@@ -103,6 +103,7 @@ class Simulator:
 
         # Open position
         pos = self._risk_mgr.open_position(signal.symbol, signal.side, signal.price)
+        pos.entry_time = entry_time or signal.timestamp
         self._positions[signal.symbol] = pos
 
         # Entry fee — market order = taker fee
@@ -150,7 +151,7 @@ class Simulator:
             symbol=symbol,
             side=pos.side,
             entry_price=pos.entry_price,
-            entry_time=0,
+            entry_time=pos.entry_time,
             exit_price=exit_price,
             exit_time=int(time.time() * 1000),
             exit_reason="REVERSAL",
@@ -222,7 +223,7 @@ class Simulator:
             symbol=pos.symbol,
             side=pos.side,
             entry_price=pos.entry_price,
-            entry_time=0,
+            entry_time=pos.entry_time,
             exit_price=exit_ev.price,
             exit_time=close_time,
             exit_reason=exit_ev.reason.value,

@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 60" fill="none">
+  <defs>
+    <linearGradient id="blueGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#4A90D9"/>
+      <stop offset="100%" stop-color="#1a3a6b"/>
+    </linearGradient>
+    <linearGradient id="silverGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#d0d0d0"/>
+      <stop offset="50%" stop-color="#f0f0f0"/>
+      <stop offset="100%" stop-color="#a0a0a0"/>
+    </linearGradient>
+    <linearGradient id="arrowGrad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#b0b0b0"/>
+      <stop offset="100%" stop-color="#e0e0e0"/>
+    </linearGradient>
+  </defs>
+  <!-- S letter -->
+  <text x="4" y="44" font-family="Arial Black, Arial, sans-serif" font-weight="900" font-size="40" fill="url(#blueGrad)" stroke="#1a3a6b" stroke-width="0.5">S</text>
+  <!-- K letter with arrow -->
+  <text x="28" y="44" font-family="Arial Black, Arial, sans-serif" font-weight="900" font-size="40" fill="url(#silverGrad)" stroke="#888" stroke-width="0.3">K</text>
+  <!-- Arrow going up-right from K -->
+  <line x1="48" y1="28" x2="62" y2="10" stroke="url(#arrowGrad)" stroke-width="3" stroke-linecap="round"/>
+  <polygon points="60,4 68,10 60,14" fill="url(#arrowGrad)"/>
+  <!-- SIGMA text -->
+  <text x="74" y="28" font-family="Arial, Helvetica, sans-serif" font-weight="700" font-size="18" fill="#c0c0c0" letter-spacing="2">SIGMA</text>
+  <!-- KAPITAL text -->
+  <text x="74" y="48" font-family="Arial, Helvetica, sans-serif" font-weight="700" font-size="18" fill="#4A90D9" letter-spacing="2">KAPITAL</text>
+</svg>
