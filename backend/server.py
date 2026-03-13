@@ -156,7 +156,28 @@ def _signal_scanner_loop() -> None:
                 if len(klines) < 200:
                     continue
 
-                df = pd.DataFrame(klines)
+                # Last element from Binance is the current forming candle — drop it
+                # but use klines[-2] (just-closed candle) for TP/SL check
+                last_closed = klines[-2] if len(klines) >= 2 else klines[-1]
+                klines_for_signal = klines[:-1]
+
+                # ── TP/SL check on last closed candle's high/low ──
+                if sim.has_position(sym):
+                    candle_high = float(last_closed["high"])
+                    candle_low = float(last_closed["low"])
+                    close_time = int(last_closed.get("close_time", 0))
+                    exit_trades = sim.process_candle(sym, candle_high, candle_low, close_time)
+                    for t in exit_trades:
+                        state["signal_log"].append({
+                            "time": time.strftime("%H:%M:%S"),
+                            "symbol": sym,
+                            "side": t.side,
+                            "price": t.exit_price,
+                            "rsi": 0,
+                            "source": f"EXIT_{t.exit_reason}",
+                        })
+
+                df = pd.DataFrame(klines_for_signal)
                 df["symbol"] = sym
 
                 engine = SignalEngine(cfg)
@@ -265,6 +286,9 @@ def start_bot(body: dict):
     for sym in symbols:
         try:
             klines = rest.fetch_klines_sync(sym, cfg["strategy"]["timeframe"], limit=1500)
+            # Drop incomplete current candle
+            if len(klines) > 1:
+                klines = klines[:-1]
             if len(klines) < 200:
                 scan_results[sym] = {
                     "status": "insufficient_data",
@@ -466,26 +490,7 @@ def get_status():
                 ask = mark_price
                 spread = 0.0
 
-            # TP/SL check on live price FIRST (before PnL calc)
-            exit_trades = sim.process_candle(sym, mark_price, mark_price, int(time.time() * 1000))
-            for t in exit_trades:
-                state["signal_log"].append({
-                    "time": time.strftime("%H:%M:%S"),
-                    "symbol": sym,
-                    "side": t.side,
-                    "price": t.exit_price,
-                    "rsi": 0,
-                    "source": f"EXIT_{t.exit_reason}",
-                })
-
-            # If position fully closed, skip adding to open positions
-            if sym not in sim.positions or sim.positions[sym].condition == 0.0:
-                continue
-
-            # Re-read pos after possible partial exits (remaining_qty may have changed)
-            pos = sim.positions[sym]
-
-            # Notional size
+            # Notional size (TP/SL now checked in signal scanner on candle close)
             notional = margin * leverage
             position_notional = notional * pos.remaining_qty
 

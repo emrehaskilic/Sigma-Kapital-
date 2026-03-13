@@ -105,10 +105,15 @@ class SignalEngine:
         return pd.DataFrame(rows)
 
     def process(self, df: pd.DataFrame) -> Signal | None:
-        """Process a full candle DataFrame and return a signal if one is generated.
+        """Process candle data — full Pine Script condition state machine.
 
-        Expects columns: open, high, low, close, volume, open_time
-        Evaluates only the most recent *closed* candle.
+        Walks the entire crossover history to maintain correct condition state
+        (0=flat, 1=LONG, -1=SHORT).  Returns a signal only when the most recent
+        *completed* alt-TF bar triggered a condition change:
+            leTrigger AND condition[1] <= 0.0 → enter LONG
+            seTrigger AND condition[1] >= 0.0 → enter SHORT
+        Incomplete alt-TF bars are excluded to match TradingView's
+        request.security() closed-bar semantics.
         """
         if len(df) < 50:
             return None
@@ -118,71 +123,102 @@ class SignalEngine:
         high = df["high"]
         low = df["low"]
 
-        # --- MA series on base timeframe ---
-        close_ma = variant(self._ma_type, close, self._ma_period,
-                           self._alma_sigma, self._alma_offset)
-        open_ma = variant(self._ma_type, open_, self._ma_period,
-                          self._alma_sigma, self._alma_offset)
-
-        # --- Alternate Resolution (Pine Script reso() equivalent) ---
-        # When enabled, crossover is checked on the higher-timeframe MA series.
-        # Base MA is still used for trend coloring; alt MA drives entry signals.
-        if self._use_alt and self._alt_mult > 1:
-            alt_df = self._resample_ohlc(df, self._alt_mult)
-            if len(alt_df) >= max(self._ma_period + 2, 10):
-                alt_close_ma = variant(self._ma_type, alt_df["close"],
-                                       self._ma_period, self._alma_sigma,
-                                       self._alma_offset)
-                alt_open_ma = variant(self._ma_type, alt_df["open"],
-                                      self._ma_period, self._alma_sigma,
-                                      self._alma_offset)
-                prev_close_alt = alt_close_ma.iloc[-2]
-                prev_open_alt = alt_open_ma.iloc[-2]
-                curr_close_alt = alt_close_ma.iloc[-1]
-                curr_open_alt = alt_open_ma.iloc[-1]
-
-                le_trigger = (prev_close_alt <= prev_open_alt and
-                              curr_close_alt > curr_open_alt)
-                se_trigger = (prev_close_alt >= prev_open_alt and
-                              curr_close_alt < curr_open_alt)
-            else:
-                # Not enough alt data — fall back to base
-                le_trigger, se_trigger = self._base_crossover(close_ma, open_ma)
-        else:
-            le_trigger, se_trigger = self._base_crossover(close_ma, open_ma)
-
-        # --- RSI (display/logging only — not an entry filter per Pine Script) ---
-        rsi_series = rsi(close, 28)
-        rsi_val = rsi_series.iloc[-1]
-
-        # --- ATR ---
+        # --- RSI / ATR ---
+        rsi_val = rsi(close, 28).iloc[-1]
         atr_val = atr(high, low, close, 50).iloc[-1]
 
         # --- Supply/Demand zones ---
         self._update_zones(df, atr_val)
 
-        # --- Generate signal ---
         last = df.iloc[-1]
         symbol = str(last.get("symbol", ""))
 
-        if le_trigger and self._trade_type in ("LONG", "BOTH"):
+        # Base close price lookup (for entry price at alt-TF transition)
+        base_times = df["open_time"].values
+        base_closes = df["close"].values
+
+        def _base_close_at(alt_open_time: int) -> float:
+            idx = np.searchsorted(base_times, alt_open_time)
+            if idx < len(base_closes):
+                return float(base_closes[idx])
+            return float(base_closes[-1])
+
+        # --- Determine MA series to walk ---
+        if self._use_alt and self._alt_mult > 1:
+            alt_df = self._resample_ohlc(df, self._alt_mult)
+            # NOTE: Keep incomplete last alt-TF bar — TradingView's request.security()
+            # updates in real-time on the current bar (lookahead only affects history).
+
+            if len(alt_df) < max(self._ma_period + 2, 10):
+                return None
+
+            close_ma = variant(self._ma_type, alt_df["close"],
+                               self._ma_period, self._alma_sigma, self._alma_offset)
+            open_ma = variant(self._ma_type, alt_df["open"],
+                              self._ma_period, self._alma_sigma, self._alma_offset)
+            bar_times = alt_df["open_time"].values
+        else:
+            close_ma = variant(self._ma_type, close, self._ma_period,
+                               self._alma_sigma, self._alma_offset)
+            open_ma = variant(self._ma_type, open_, self._ma_period,
+                              self._alma_sigma, self._alma_offset)
+            bar_times = df["open_time"].values
+
+        close_ma_vals = close_ma.values
+        open_ma_vals = open_ma.values
+
+        # --- Walk all bars — Pine Script condition state machine ---
+        condition = 0.0  # 0=flat, 1=LONG, -1=SHORT
+        entry_price = 0.0
+        entry_time = 0
+        last_transition_idx = -1
+
+        for i in range(1, len(close_ma_vals)):
+            prev_c = close_ma_vals[i - 1]
+            prev_o = open_ma_vals[i - 1]
+            curr_c = close_ma_vals[i]
+            curr_o = open_ma_vals[i]
+
+            if np.isnan(prev_c) or np.isnan(prev_o) or np.isnan(curr_c) or np.isnan(curr_o):
+                continue
+
+            le_trigger = (prev_c <= prev_o and curr_c > curr_o)
+            se_trigger = (prev_c >= prev_o and curr_c < curr_o)
+
+            if le_trigger and condition <= 0.0:
+                condition = 1.0
+                entry_price = _base_close_at(bar_times[i])
+                entry_time = int(bar_times[i])
+                last_transition_idx = i
+
+            elif se_trigger and condition >= 0.0:
+                condition = -1.0
+                entry_price = _base_close_at(bar_times[i])
+                entry_time = int(bar_times[i])
+                last_transition_idx = i
+
+        # Only emit signal if transition happened on the LAST completed bar
+        if last_transition_idx != len(close_ma_vals) - 1:
+            return None
+
+        if condition == 1.0 and self._trade_type in ("LONG", "BOTH"):
             return Signal(
-                timestamp=int(last["open_time"]),
+                timestamp=entry_time,
                 symbol=symbol,
                 side="LONG",
-                price=last["close"],
+                price=entry_price,
                 rsi_value=rsi_val,
                 atr_value=atr_val,
                 supply_zones=[(z["top"], z["bottom"]) for z in self._supply_zones[:5]],
                 demand_zones=[(z["top"], z["bottom"]) for z in self._demand_zones[:5]],
             )
 
-        if se_trigger and self._trade_type in ("SHORT", "BOTH"):
+        if condition == -1.0 and self._trade_type in ("SHORT", "BOTH"):
             return Signal(
-                timestamp=int(last["open_time"]),
+                timestamp=entry_time,
                 symbol=symbol,
                 side="SHORT",
-                price=last["close"],
+                price=entry_price,
                 rsi_value=rsi_val,
                 atr_value=atr_val,
                 supply_zones=[(z["top"], z["bottom"]) for z in self._supply_zones[:5]],
@@ -230,9 +266,10 @@ class SignalEngine:
         # Determine which MA series to walk
         if self._use_alt and self._alt_mult > 1:
             alt_df = self._resample_ohlc(df, self._alt_mult)
+
             if len(alt_df) < max(self._ma_period + 2, 10):
-                # Not enough alt data — fall back to single-bar process()
-                return self.process(df)
+                # Not enough alt data
+                return None
             close_ma = variant(self._ma_type, alt_df["close"],
                                self._ma_period, self._alma_sigma,
                                self._alma_offset)

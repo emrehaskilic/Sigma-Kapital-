@@ -251,6 +251,9 @@ class Backtester:
             idx = min(idx, len(series) - 1)
             return float(series.iloc[idx])
 
+        # Walk all bars — Pine Script condition state machine.
+        # condition tracks MA crossover state independently of trade_type filter.
+        # This matches dry-run process() behavior exactly.
         condition = 0.0
 
         for i in range(1, len(close_ma_vals)):
@@ -268,22 +271,26 @@ class Backtester:
             t = int(bar_times[i])
             entry_price = _base_close_at(t)
 
-            if le_trigger and condition <= 0.0 and trade_type in ("LONG", "BOTH"):
+            # Condition updates FIRST (regardless of trade_type), then signal
+            # is emitted only if trade_type matches — same as Pine Script
+            if le_trigger and condition <= 0.0:
                 condition = 1.0
-                signals[t] = Signal(
-                    timestamp=t, symbol=symbol, side="LONG",
-                    price=entry_price,
-                    rsi_value=_indicator_at(rsi_series, t),
-                    atr_value=_indicator_at(atr_series, t),
-                )
-            elif se_trigger and condition >= 0.0 and trade_type in ("SHORT", "BOTH"):
+                if trade_type in ("LONG", "BOTH"):
+                    signals[t] = Signal(
+                        timestamp=t, symbol=symbol, side="LONG",
+                        price=entry_price,
+                        rsi_value=_indicator_at(rsi_series, t),
+                        atr_value=_indicator_at(atr_series, t),
+                    )
+            elif se_trigger and condition >= 0.0:
                 condition = -1.0
-                signals[t] = Signal(
-                    timestamp=t, symbol=symbol, side="SHORT",
-                    price=entry_price,
-                    rsi_value=_indicator_at(rsi_series, t),
-                    atr_value=_indicator_at(atr_series, t),
-                )
+                if trade_type in ("SHORT", "BOTH"):
+                    signals[t] = Signal(
+                        timestamp=t, symbol=symbol, side="SHORT",
+                        price=entry_price,
+                        rsi_value=_indicator_at(rsi_series, t),
+                        atr_value=_indicator_at(atr_series, t),
+                    )
 
         return signals
 
