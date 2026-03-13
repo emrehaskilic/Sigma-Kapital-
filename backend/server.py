@@ -180,11 +180,15 @@ def _signal_scanner_loop() -> None:
                 df = pd.DataFrame(klines_for_signal)
                 df["symbol"] = sym
 
+                # Use process_backfill to get the CURRENT active state
+                # (not just "did a transition happen on the last bar").
+                # This ensures we never miss a crossover even if the
+                # scanner didn't run at the exact candle boundary.
                 engine = SignalEngine(cfg)
-                signal = engine.process(df)
+                signal = engine.process_backfill(df)
 
                 if signal:
-                    # Check if we need to reverse or open a new position
+                    # Only act if direction differs from current position
                     has_pos = sim.has_position(sym)
                     if has_pos:
                         existing = sim.positions[sym]
