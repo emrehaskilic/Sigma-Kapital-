@@ -69,12 +69,18 @@ class SignalEngine:
         self._demand_zones: list[dict[str, float]] = []
 
     @staticmethod
-    def _resample_ohlc(df: pd.DataFrame, multiplier: int) -> pd.DataFrame:
+    def _resample_ohlc(
+        df: pd.DataFrame, multiplier: int, *, drop_incomplete: bool = True,
+    ) -> pd.DataFrame:
         """Resample base-timeframe candles into a higher timeframe.
 
         Aligns to calendar time boundaries to match TradingView's
         request.security() behavior.  E.g. 15m * 8 = 120min bars
         starting at 00:00, 02:00, 04:00 etc.
+
+        When *drop_incomplete* is True (default) the last bucket is removed
+        if it contains fewer than *multiplier* base candles, matching
+        TradingView's closed-bar semantics (lookahead_off).
         """
         if len(df) < multiplier:
             return df
@@ -93,13 +99,17 @@ class SignalEngine:
 
         grouped = df_copy.groupby("_bucket", sort=True)
         rows = []
-        for _, chunk in grouped:
+        for bucket_key, chunk in grouped:
+            # Skip incomplete last bar if requested
+            if drop_incomplete and bucket_key == bucket[-1] and len(chunk) < multiplier:
+                continue
             rows.append({
                 "open_time": chunk["open_time"].iloc[0],
                 "open": chunk["open"].iloc[0],
                 "high": chunk["high"].max(),
                 "low": chunk["low"].min(),
                 "close": chunk["close"].iloc[-1],
+                "first_close": chunk["close"].iloc[0],
                 "volume": chunk["volume"].sum() if "volume" in chunk.columns else 0,
             })
         return pd.DataFrame(rows)
@@ -135,9 +145,7 @@ class SignalEngine:
 
         # --- Determine MA series to walk ---
         if self._use_alt and self._alt_mult > 1:
-            alt_df = self._resample_ohlc(df, self._alt_mult)
-            # NOTE: Keep incomplete last alt-TF bar — TradingView's request.security()
-            # updates in real-time on the current bar (lookahead only affects history).
+            alt_df = self._resample_ohlc(df, self._alt_mult, drop_incomplete=True)
 
             if len(alt_df) < max(self._ma_period + 2, 10):
                 return None
@@ -147,14 +155,14 @@ class SignalEngine:
             open_ma = variant(self._ma_type, alt_df["open"],
                               self._ma_period, self._alma_sigma, self._alma_offset)
             bar_times = alt_df["open_time"].values
-            bar_closes = alt_df["close"].values
+            bar_first_closes = alt_df["first_close"].values
         else:
             close_ma = variant(self._ma_type, close, self._ma_period,
                                self._alma_sigma, self._alma_offset)
             open_ma = variant(self._ma_type, open_, self._ma_period,
                               self._alma_sigma, self._alma_offset)
             bar_times = df["open_time"].values
-            bar_closes = df["close"].values
+            bar_first_closes = df["close"].values
 
         close_ma_vals = close_ma.values
         open_ma_vals = open_ma.values
@@ -179,13 +187,13 @@ class SignalEngine:
 
             if le_trigger and condition <= 0.0:
                 condition = 1.0
-                entry_price = float(bar_closes[i])
+                entry_price = float(bar_first_closes[i])
                 entry_time = int(bar_times[i])
                 last_transition_idx = i
 
             elif se_trigger and condition >= 0.0:
                 condition = -1.0
-                entry_price = float(bar_closes[i])
+                entry_price = float(bar_first_closes[i])
                 entry_time = int(bar_times[i])
                 last_transition_idx = i
 
@@ -250,8 +258,10 @@ class SignalEngine:
         symbol = str(last.get("symbol", ""))
 
         # Determine which MA series to walk
+        # Use drop_incomplete=False to match TradingView's realtime behavior:
+        # request.security() updates live on the current forming HTF bar.
         if self._use_alt and self._alt_mult > 1:
-            alt_df = self._resample_ohlc(df, self._alt_mult)
+            alt_df = self._resample_ohlc(df, self._alt_mult, drop_incomplete=False)
 
             if len(alt_df) < max(self._ma_period + 2, 10):
                 # Not enough alt data
@@ -263,14 +273,14 @@ class SignalEngine:
                               self._ma_period, self._alma_sigma,
                               self._alma_offset)
             bar_times = alt_df["open_time"].values
-            bar_closes = alt_df["close"].values
+            bar_first_closes = alt_df["first_close"].values
         else:
             close_ma = variant(self._ma_type, close, self._ma_period,
                                self._alma_sigma, self._alma_offset)
             open_ma = variant(self._ma_type, open_, self._ma_period,
                               self._alma_sigma, self._alma_offset)
             bar_times = df["open_time"].values
-            bar_closes = df["close"].values
+            bar_first_closes = df["close"].values
 
         close_ma_vals = close_ma.values
         open_ma_vals = open_ma.values
@@ -295,12 +305,12 @@ class SignalEngine:
 
             if le_trigger and condition <= 0.0:
                 condition = 1.0
-                entry_price = float(bar_closes[i])
+                entry_price = float(bar_first_closes[i])
                 entry_time = int(bar_times[i])
 
             elif se_trigger and condition >= 0.0:
                 condition = -1.0
-                entry_price = float(bar_closes[i])
+                entry_price = float(bar_first_closes[i])
                 entry_time = int(bar_times[i])
 
         # After walking all bars, emit a signal for the active position

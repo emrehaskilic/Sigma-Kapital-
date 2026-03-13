@@ -231,12 +231,12 @@ class Backtester:
             close_ma = variant(ma_type, alt_df["close"], ma_period, alma_sigma, alma_offset)
             open_ma = variant(ma_type, alt_df["open"], ma_period, alma_sigma, alma_offset)
             bar_times = alt_df["open_time"].values
-            bar_closes_alt = alt_df["close"].values
+            bar_first_closes = alt_df["first_close"].values
         else:
             close_ma = variant(ma_type, close, ma_period, alma_sigma, alma_offset)
             open_ma = variant(ma_type, open_, ma_period, alma_sigma, alma_offset)
             bar_times = df["open_time"].values
-            bar_closes_alt = df["close"].values
+            bar_first_closes = df["close"].values
 
         close_ma_vals = close_ma.values
         open_ma_vals = open_ma.values
@@ -264,7 +264,7 @@ class Backtester:
             se_trigger = prev_c >= prev_o and curr_c < curr_o
 
             t = int(bar_times[i])
-            entry_price = float(bar_closes_alt[i])
+            entry_price = float(bar_first_closes[i])
 
             # Condition updates FIRST (regardless of trade_type), then signal
             # is emitted only if trade_type matches — same as Pine Script
