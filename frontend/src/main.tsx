@@ -3,10 +3,11 @@ import { createRoot } from 'react-dom/client'
 import './index.css'
 import App from './App.tsx'
 import BacktestPage from './pages/BacktestPage.tsx'
+import LivePage from './pages/LivePage.tsx'
 import { Navbar } from './components/Navbar.tsx'
 
 function Root() {
-  const [page, setPage] = useState<"dashboard" | "backtest">("dashboard");
+  const [page, setPage] = useState<"dashboard" | "backtest" | "live">("dashboard");
 
   return (
     <>
@@ -16,6 +17,9 @@ function Root() {
       </div>
       <div style={{ display: page === "backtest" ? "block" : "none" }}>
         <BacktestPage />
+      </div>
+      <div style={{ display: page === "live" ? "block" : "none" }}>
+        <LivePage />
       </div>
     </>
   );

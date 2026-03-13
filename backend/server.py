@@ -18,6 +18,8 @@ from core.data.binance_ws import BinanceWS
 from core.strategy.signals import SignalEngine
 from core.engine.simulator import Simulator, Trade
 from core.engine.backtester import Backtester
+from core.engine.live_executor import LiveExecutor, PairConfig, PairState, LiveTrade
+from core.data.binance_futures import BinanceFutures
 from core.strategy.risk_manager import RiskManager
 
 import pandas as pd
@@ -188,6 +190,14 @@ def _signal_scanner_loop() -> None:
                                 "rsi": 0,
                                 "source": f"EXIT_{t.exit_reason}",
                             })
+                        # Update scan_results if position fully closed by TP/SL
+                        if not sim.has_position(sym):
+                            state["scan_results"][sym] = {
+                                "status": "closed_tp",
+                                "side": state["scan_results"].get(sym, {}).get("side", ""),
+                                "price": state["scan_results"].get(sym, {}).get("price", 0),
+                                "last_price": float(last_closed["close"]),
+                            }
 
                     if signal:
                         # Only act if direction differs from current position
@@ -318,6 +328,22 @@ def start_bot(body: dict):
 
             engine = SignalEngine(cfg)
             signal = engine.process_backfill(df)
+
+            # Also check forming bar for a more recent crossover
+            # process_backfill uses drop_incomplete=True so it misses
+            # crossovers on the forming alt-TF bar.  process() includes
+            # it (drop_incomplete=False) — matching TradingView real-time.
+            live_signal = engine.process(df)
+            if live_signal:
+                # Forming bar has a NEW crossover — use it instead
+                if signal is None or live_signal.side != signal.side:
+                    logger.info(
+                        "[INIT] %s forming-bar override: backfill=%s → live=%s",
+                        sym,
+                        signal.side if signal else "None",
+                        live_signal.side,
+                    )
+                    signal = live_signal
 
             last_price = float(df["close"].iloc[-1])
 
@@ -772,3 +798,577 @@ def backtest_reset():
     _bt_state["result"] = None
     _bt_state["error"] = None
     return {"status": "reset"}
+
+
+# ══════════════════════════════════════════════════════════════════════
+# LIVE TRADING ENDPOINTS
+# ══════════════════════════════════════════════════════════════════════
+
+_live_state: dict[str, Any] = {
+    "running": False,
+    "executor": None,
+    "client": None,
+    "active_symbols": [],
+    "pair_configs": {},      # symbol → {margin, leverage}
+    "scan_results": {},
+    "signal_log": [],
+    "api_key": "",
+    "api_secret": "",
+    "testnet": False,
+}
+_live_lock = threading.Lock()
+_live_ws_instance: BinanceWS | None = None
+_live_ws_book_data: dict[str, dict[str, float]] = {}
+_live_ws_book_lock = threading.Lock()
+
+
+@app.get("/api/live/balance")
+def live_balance():
+    """Fetch Binance Futures USDT balance. Requires API keys."""
+    api_key = _live_state.get("api_key", "")
+    api_secret = _live_state.get("api_secret", "")
+    testnet = _live_state.get("testnet", False)
+
+    if not api_key or not api_secret:
+        return {"error": "API keys not configured"}
+
+    try:
+        client = BinanceFutures(api_key, api_secret, testnet=testnet)
+        bal = client.get_balance()
+        return {"balance": bal["balance"], "available": bal["available"], "unrealized_pnl": bal["unrealized_pnl"]}
+    except Exception as e:
+        return {"error": str(e)[:200]}
+
+
+@app.post("/api/live/keys")
+def live_set_keys(body: dict):
+    """Save API keys (session only — not persisted to disk)."""
+    _live_state["api_key"] = body.get("api_key", "")
+    _live_state["api_secret"] = body.get("api_secret", "")
+    _live_state["testnet"] = body.get("testnet", False)
+
+    # Validate keys by fetching balance
+    try:
+        client = BinanceFutures(
+            _live_state["api_key"], _live_state["api_secret"],
+            testnet=_live_state["testnet"],
+        )
+        bal = client.get_balance()
+        return {
+            "status": "ok",
+            "balance": bal["balance"],
+            "available": bal["available"],
+        }
+    except Exception as e:
+        _live_state["api_key"] = ""
+        _live_state["api_secret"] = ""
+        return {"error": f"Invalid API keys: {str(e)[:200]}"}
+
+
+@app.get("/api/live/positions")
+def live_exchange_positions():
+    """Get existing open positions from Binance exchange."""
+    api_key = _live_state.get("api_key", "")
+    api_secret = _live_state.get("api_secret", "")
+    if not api_key:
+        return {"error": "API keys not configured"}
+
+    try:
+        client = BinanceFutures(api_key, api_secret, testnet=_live_state.get("testnet", False))
+        positions = client.get_positions()
+        return {"positions": positions}
+    except Exception as e:
+        return {"error": str(e)[:200]}
+
+
+def _live_signal_scanner_loop() -> None:
+    """Background thread: signal scanner for live trading mode.
+
+    Same logic as dry-run scanner, but uses LiveExecutor instead of Simulator.
+    """
+    logger.info("Live signal scanner started")
+    last_scan_bucket = 0
+
+    while _live_state["running"]:
+        time.sleep(5)
+
+        if not _live_state["running"] or not _live_state["active_symbols"]:
+            continue
+
+        cfg = state["config"]
+        tf = cfg["strategy"]["timeframe"]
+        interval_s = _TIMEFRAME_SECONDS.get(tf, 900)
+
+        now_ts = int(time.time())
+        current_bucket = now_ts // interval_s
+        if current_bucket == last_scan_bucket:
+            continue
+        last_scan_bucket = current_bucket
+        time.sleep(10)
+
+        logger.info("Live scanner: new %s candle — rescanning %d symbols",
+                     tf, len(_live_state["active_symbols"]))
+
+        executor: LiveExecutor | None = _live_state["executor"]
+        if not executor:
+            continue
+
+        rest: BinanceRest = state["rest"]
+
+        for sym in list(_live_state["active_symbols"]):
+            if not _live_state["running"]:
+                break
+            try:
+                klines = rest.fetch_klines_sync(sym, tf, limit=1500)
+                if len(klines) < 200:
+                    continue
+
+                last_closed = klines[-2] if len(klines) >= 2 else klines[-1]
+                klines_for_signal = klines[:-1]
+
+                df = pd.DataFrame(klines_for_signal)
+                df["symbol"] = sym
+
+                engine = SignalEngine(cfg)
+                signal = engine.process(df)
+
+                with _live_lock:
+                    # TP/SL check on last closed candle
+                    if executor.has_position(sym):
+                        candle_high = float(last_closed["high"])
+                        candle_low = float(last_closed["low"])
+                        close_time = int(last_closed.get("close_time", 0))
+                        exit_trades = executor.process_candle(sym, candle_high, candle_low, close_time)
+                        for t in exit_trades:
+                            _live_state["signal_log"].append({
+                                "time": time.strftime("%H:%M:%S"),
+                                "symbol": sym,
+                                "side": t.side,
+                                "price": t.exit_price,
+                                "rsi": 0,
+                                "source": f"LIVE_EXIT_{t.exit_reason}",
+                            })
+                        # Update scan_results if position fully closed by TP/SL
+                        if not executor.has_position(sym):
+                            _live_state["scan_results"][sym] = {
+                                "status": "closed_tp",
+                                "side": _live_state["scan_results"].get(sym, {}).get("side", ""),
+                                "price": _live_state["scan_results"].get(sym, {}).get("price", 0),
+                                "last_price": float(last_closed["close"]),
+                            }
+
+                    if signal:
+                        has_pos = executor.has_position(sym)
+                        if has_pos:
+                            existing = executor.positions[sym]
+                            if existing.side == signal.side:
+                                continue
+
+                        reversal_trades = executor.process_signal(signal)
+                        for rt in reversal_trades:
+                            _live_state["signal_log"].append({
+                                "time": time.strftime("%H:%M:%S"),
+                                "symbol": sym,
+                                "side": rt.side,
+                                "price": rt.exit_price,
+                                "rsi": 0,
+                                "source": f"LIVE_EXIT_{rt.exit_reason}",
+                            })
+
+                        pos = executor.positions.get(sym)
+                        if pos and pos.condition != 0.0:
+                            logger.info(
+                                "[LIVE_ENTRY] %s %s @ %.4f | TP1=%.4f TP2=%.4f TP3=%.4f SL=%.4f",
+                                sym, signal.side, signal.price,
+                                pos.tp1_line, pos.tp2_line, pos.tp3_line, pos.sl_line,
+                            )
+
+                        _live_state["signal_log"].append({
+                            "time": time.strftime("%H:%M:%S"),
+                            "symbol": sym,
+                            "side": signal.side,
+                            "price": signal.price,
+                            "rsi": round(signal.rsi_value, 2),
+                            "source": "LIVE_SIGNAL",
+                        })
+
+                        _live_state["scan_results"][sym] = {
+                            "status": "signal",
+                            "side": signal.side,
+                            "price": signal.price,
+                            "rsi": round(signal.rsi_value, 2),
+                            "atr": round(signal.atr_value, 4),
+                            "last_price": float(df["close"].iloc[-1]),
+                        }
+
+            except Exception as e:
+                logger.error("Live scanner error for %s: %s", sym, str(e)[:100])
+
+
+async def _on_live_book_ticker(ticker: dict) -> None:
+    """Update live mode book ticker cache."""
+    with _live_ws_book_lock:
+        _live_ws_book_data[ticker["symbol"]] = ticker
+
+
+def _start_live_ws_loop(symbols: list[str]) -> None:
+    """Start WS bookTicker for live mode."""
+    global _live_ws_instance
+    loop = asyncio.new_event_loop()
+
+    async def _run():
+        global _live_ws_instance
+        ws = BinanceWS(on_candle=_on_candle_noop, on_book_ticker=_on_live_book_ticker)
+        _live_ws_instance = ws
+        await ws.connect()
+        for sym in symbols:
+            await ws.subscribe_book_ticker(sym)
+        logger.info("Live WS bookTicker subscribed for %d symbols", len(symbols))
+        while _live_state["running"]:
+            await asyncio.sleep(1)
+        try:
+            await ws.close()
+        except Exception:
+            pass
+        _live_ws_instance = None
+
+    loop.run_until_complete(_run())
+    loop.close()
+
+
+@app.post("/api/live/start")
+def live_start(body: dict):
+    """Start live trading mode.
+
+    Body: {
+        pair_configs: {BTCUSDT: {margin: 50, leverage: 20}, ...}
+    }
+    """
+    if _live_state["running"]:
+        return {"error": "Live mode already running"}
+
+    api_key = _live_state.get("api_key", "")
+    api_secret = _live_state.get("api_secret", "")
+    if not api_key or not api_secret:
+        return {"error": "API keys not configured"}
+
+    pair_configs = body.get("pair_configs", {})
+    if not pair_configs:
+        return {"error": "No pair configs provided"}
+
+    cfg = state["config"]
+
+    # Create Binance client and LiveExecutor
+    client = BinanceFutures(api_key, api_secret, testnet=_live_state.get("testnet", False))
+    executor = LiveExecutor(client, cfg)
+
+    # Configure each pair
+    symbols = []
+    for sym, pc in pair_configs.items():
+        margin = float(pc.get("margin", 100))
+        leverage = int(pc.get("leverage", 10))
+        executor.configure_pair(sym, margin, leverage)
+        symbols.append(sym)
+
+    # Fetch initial balance
+    bal = executor.refresh_balance()
+
+    # Load existing exchange positions for display
+    exchange_positions = executor.load_exchange_positions()
+
+    # Run initial scan (same as dry-run) to detect current signal state
+    scan_results = {}
+    signal_log = []
+    rest: BinanceRest = state["rest"]
+
+    for sym in symbols:
+        try:
+            klines = rest.fetch_klines_sync(sym, cfg["strategy"]["timeframe"], limit=1500)
+            if len(klines) > 1:
+                klines = klines[:-1]
+            if len(klines) < 200:
+                scan_results[sym] = {"status": "insufficient_data", "candles": len(klines)}
+                continue
+
+            df = pd.DataFrame(klines)
+            df["symbol"] = sym
+
+            engine = SignalEngine(cfg)
+            signal = engine.process_backfill(df)
+
+            # Also check forming bar for a more recent crossover
+            live_signal = engine.process(df)
+            if live_signal:
+                if signal is None or live_signal.side != signal.side:
+                    logger.info(
+                        "[LIVE_INIT] %s forming-bar override: backfill=%s → live=%s",
+                        sym,
+                        signal.side if signal else "None",
+                        live_signal.side,
+                    )
+                    signal = live_signal
+
+            last_price = float(df["close"].iloc[-1])
+
+            if signal:
+                scan_results[sym] = {
+                    "status": "signal_detected",
+                    "side": signal.side,
+                    "price": signal.price,
+                    "rsi": round(signal.rsi_value, 2),
+                    "atr": round(signal.atr_value, 4),
+                    "last_price": last_price,
+                    "pair_state": "OBSERVING",
+                }
+                signal_log.append({
+                    "time": time.strftime("%H:%M:%S"),
+                    "symbol": sym,
+                    "side": signal.side,
+                    "price": signal.price,
+                    "rsi": round(signal.rsi_value, 2),
+                    "source": "INITIAL_SCAN",
+                })
+            else:
+                from core.strategy.indicators import variant, rsi as calc_rsi
+                close_ma = variant(
+                    cfg["strategy"]["ma_type"], df["close"],
+                    cfg["strategy"]["ma_period"],
+                    cfg["strategy"]["alma_sigma"],
+                    cfg["strategy"]["alma_offset"],
+                )
+                open_ma = variant(
+                    cfg["strategy"]["ma_type"], df["open"],
+                    cfg["strategy"]["ma_period"],
+                    cfg["strategy"]["alma_sigma"],
+                    cfg["strategy"]["alma_offset"],
+                )
+                trend = "BULLISH" if close_ma.iloc[-1] > open_ma.iloc[-1] else "BEARISH"
+                rsi_val = calc_rsi(df["close"], 28).iloc[-1]
+                scan_results[sym] = {
+                    "status": "monitoring",
+                    "trend": trend,
+                    "last_price": last_price,
+                    "rsi": round(float(rsi_val), 2),
+                    "pair_state": "OBSERVING",
+                }
+        except Exception as e:
+            scan_results[sym] = {"status": "error", "message": str(e)[:100]}
+
+    # Save state
+    _live_state["running"] = True
+    _live_state["executor"] = executor
+    _live_state["client"] = client
+    _live_state["active_symbols"] = symbols
+    _live_state["pair_configs"] = pair_configs
+    _live_state["scan_results"] = scan_results
+    _live_state["signal_log"] = signal_log
+
+    # Start WS bookTicker
+    _live_ws_book_data.clear()
+    ws_thread = threading.Thread(target=_start_live_ws_loop, args=(symbols,), daemon=True)
+    ws_thread.start()
+
+    # Start live signal scanner
+    scanner_thread = threading.Thread(target=_live_signal_scanner_loop, daemon=True)
+    scanner_thread.start()
+
+    return {
+        "status": "started",
+        "pairs": len(symbols),
+        "balance": bal,
+        "exchange_positions": exchange_positions,
+        "scan_results": scan_results,
+    }
+
+
+@app.post("/api/live/stop")
+def live_stop():
+    """Stop live trading. Does NOT close open positions."""
+    _live_state["running"] = False
+    _live_state["active_symbols"] = []
+    _live_state["scan_results"] = {}
+    _live_state["signal_log"] = []
+
+    # Keep executor reference for stats but mark as stopped
+    _live_ws_book_data.clear()
+    global _live_ws_instance
+    _live_ws_instance = None
+
+    return {"status": "stopped"}
+
+
+@app.post("/api/live/emergency-close")
+def live_emergency_close():
+    """Emergency: close all positions immediately."""
+    executor: LiveExecutor | None = _live_state.get("executor")
+    if not executor:
+        return {"error": "No live executor"}
+
+    with _live_lock:
+        trades = executor.emergency_close_all()
+
+    return {
+        "status": "closed",
+        "trades_closed": len(trades),
+        "trades": [
+            {"symbol": t.symbol, "side": t.side, "pnl_usdt": t.pnl_usdt}
+            for t in trades
+        ],
+    }
+
+
+@app.get("/api/live/status")
+def live_status():
+    """Main polling endpoint for live mode — returns full dashboard state."""
+    executor: LiveExecutor | None = _live_state.get("executor")
+    cfg = state["config"]
+
+    if not executor:
+        return {
+            "live_running": False,
+            "balance": 0,
+            "available": 0,
+            "positions": [],
+            "pair_summaries": {},
+            "stats": {},
+            "signal_log": [],
+            "trade_log": [],
+            "totals": {},
+        }
+
+    # Refresh balance periodically (not every poll — expensive)
+    # The executor caches balance from last refresh
+
+    # Fetch live orderbook
+    orderbook = {}
+    live_prices = {}
+    symbols = _live_state.get("active_symbols", [])
+
+    if _live_state["running"] and symbols:
+        with _live_ws_book_lock:
+            ws_data = {sym: _live_ws_book_data[sym] for sym in symbols if sym in _live_ws_book_data}
+        orderbook = ws_data
+        for sym, ob in orderbook.items():
+            live_prices[sym] = (ob["bid"] + ob["ask"]) / 2
+
+    # Positions with live PnL
+    positions = []
+    with _live_lock:
+        position_snapshot = [
+            (sym, pos) for sym, pos in executor.positions.items()
+            if pos.condition != 0.0
+        ]
+
+    for sym, pos in position_snapshot:
+        pc = _live_state["pair_configs"].get(sym, {})
+        margin = float(pc.get("margin", 100))
+        leverage = int(pc.get("leverage", 10))
+
+        ob = orderbook.get(sym)
+        if ob:
+            mark_price = ob["ask"] if pos.side == "LONG" else ob["bid"]
+            bid = ob["bid"]
+            ask = ob["ask"]
+            spread = ask - bid
+        else:
+            mark_price = pos.entry_price
+            bid = mark_price
+            ask = mark_price
+            spread = 0.0
+
+        notional = margin * leverage * pos.remaining_qty
+
+        if pos.side == "LONG":
+            upnl_pct = (mark_price - pos.entry_price) / pos.entry_price * 100
+        else:
+            upnl_pct = (pos.entry_price - mark_price) / pos.entry_price * 100
+        upnl_usdt = notional * upnl_pct / 100
+
+        positions.append({
+            "symbol": sym,
+            "side": pos.side,
+            "entry_price": pos.entry_price,
+            "mark_price": round(mark_price, 4),
+            "bid": round(bid, 4),
+            "ask": round(ask, 4),
+            "spread": round(spread, 6),
+            "notional_usdt": round(notional, 2),
+            "tp1": pos.tp1_line,
+            "tp2": pos.tp2_line,
+            "tp3": pos.tp3_line,
+            "sl": pos.sl_line,
+            "condition": pos.condition,
+            "remaining_qty": pos.remaining_qty,
+            "unrealized_pnl_usdt": round(upnl_usdt, 4),
+            "unrealized_pnl_pct": round(upnl_pct, 4),
+            "pair_state": executor.get_pair_state(sym),
+            "margin": margin,
+            "leverage": leverage,
+        })
+
+    # Per-pair summaries
+    pair_summaries = {}
+    for sym in symbols:
+        sym_trades = [t for t in executor.trades if t.symbol == sym]
+        sym_realized = sum(t.pnl_usdt for t in sym_trades)
+        sym_fees = sum(t.fee_usdt for t in sym_trades)
+
+        pos_match = next((p for p in positions if p["symbol"] == sym), None)
+        sym_unrealized = pos_match["unrealized_pnl_usdt"] if pos_match else 0.0
+        current_price = live_prices.get(sym, 0)
+
+        ob = orderbook.get(sym, {})
+        scan = _live_state["scan_results"].get(sym, {})
+        pair_summaries[sym] = {
+            "last_price": round(current_price, 4),
+            "bid": round(ob.get("bid", current_price), 4),
+            "ask": round(ob.get("ask", current_price), 4),
+            "spread": round(ob.get("ask", 0) - ob.get("bid", 0), 6) if ob else 0,
+            "status": scan.get("status", "waiting"),
+            "trend": scan.get("trend", ""),
+            "side": scan.get("side", ""),
+            "rsi": scan.get("rsi", 0),
+            "unrealized_pnl": round(sym_unrealized, 4),
+            "realized_pnl": round(sym_realized, 4),
+            "total_pnl": round(sym_unrealized + sym_realized, 4),
+            "fees": round(sym_fees, 4),
+            "trade_count": len(sym_trades),
+            "pair_state": executor.get_pair_state(sym),
+        }
+
+    stats = executor.get_stats()
+    total_unrealized = sum(p["unrealized_pnl_usdt"] for p in positions)
+
+    return {
+        "live_running": _live_state["running"],
+        "balance": round(executor.balance, 2),
+        "available": round(executor.available_balance, 2),
+        "active_symbols": symbols,
+        "stats": stats,
+        "positions": positions,
+        "pair_summaries": pair_summaries,
+        "signal_log": _live_state["signal_log"][-50:],
+        "trade_log": [
+            {
+                "id": t.id,
+                "symbol": t.symbol,
+                "side": t.side,
+                "entry_price": t.entry_price,
+                "exit_price": t.exit_price,
+                "exit_reason": t.exit_reason,
+                "pnl_usdt": t.pnl_usdt,
+                "pnl_pct": t.pnl_percent,
+                "fee_usdt": t.fee_usdt,
+                "leverage": t.leverage,
+            }
+            for t in executor.trades
+        ],
+        "totals": {
+            "unrealized_pnl": round(total_unrealized, 4),
+            "realized_pnl": round(stats["total_pnl"], 4),
+            "total_pnl": round(total_unrealized + stats["total_pnl"], 4),
+            "total_fees": round(stats["total_fees"], 4),
+            "net_pnl": round(total_unrealized + stats["total_pnl"] - stats["total_fees"], 4),
+        },
+        "pair_configs": _live_state.get("pair_configs", {}),
+    }

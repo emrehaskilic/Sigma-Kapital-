@@ -1,17 +1,19 @@
 interface NavbarProps {
-  page: "dashboard" | "backtest";
-  setPage: (p: "dashboard" | "backtest") => void;
+  page: "dashboard" | "backtest" | "live";
+  setPage: (p: "dashboard" | "backtest" | "live") => void;
 }
 
 export function Navbar({ page, setPage }: NavbarProps) {
-  const tab = (id: "dashboard" | "backtest", label: string) => (
+  const tab = (id: "dashboard" | "backtest" | "live", label: string, extraClass?: string) => (
     <button
       onClick={() => setPage(id)}
       className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${
         page === id
-          ? "bg-sky-500/15 text-sky-400"
+          ? id === "live"
+            ? "bg-emerald-500/15 text-emerald-400 border border-emerald-500/25"
+            : "bg-sky-500/15 text-sky-400"
           : "text-slate-400 hover:text-slate-200 hover:bg-slate-700/30"
-      }`}
+      } ${extraClass || ""}`}
     >
       {label}
     </button>
@@ -24,8 +26,9 @@ export function Navbar({ page, setPage }: NavbarProps) {
           <img src="/logo.svg" alt="Sigma Kapital" className="h-7" />
         </div>
         <div className="flex gap-1">
-          {tab("dashboard", "Dashboard")}
+          {tab("dashboard", "Dry-Run")}
           {tab("backtest", "Backtest")}
+          {tab("live", "LIVE")}
         </div>
       </div>
     </nav>

@@ -1,4 +1,4 @@
-const BASE = "http://localhost:8080";
+const BASE = "http://localhost:8000";
 
 export async function fetchSymbols(): Promise<{ symbols: string[]; count: number }> {
   const res = await fetch(`${BASE}/api/symbols`);
@@ -61,5 +61,50 @@ export async function fetchBacktestResults() {
 
 export async function resetBacktest() {
   const res = await fetch(`${BASE}/api/backtest/reset`, { method: "POST" });
+  return res.json();
+}
+
+// ── Live Trading API ──
+
+export async function liveSetKeys(apiKey: string, apiSecret: string, testnet: boolean) {
+  const res = await fetch(`${BASE}/api/live/keys`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ api_key: apiKey, api_secret: apiSecret, testnet }),
+  });
+  return res.json();
+}
+
+export async function liveGetBalance() {
+  const res = await fetch(`${BASE}/api/live/balance`);
+  return res.json();
+}
+
+export async function liveGetExchangePositions() {
+  const res = await fetch(`${BASE}/api/live/positions`);
+  return res.json();
+}
+
+export async function liveStart(pairConfigs: Record<string, { margin: number; leverage: number }>) {
+  const res = await fetch(`${BASE}/api/live/start`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ pair_configs: pairConfigs }),
+  });
+  return res.json();
+}
+
+export async function liveStop() {
+  const res = await fetch(`${BASE}/api/live/stop`, { method: "POST" });
+  return res.json();
+}
+
+export async function liveEmergencyClose() {
+  const res = await fetch(`${BASE}/api/live/emergency-close`, { method: "POST" });
+  return res.json();
+}
+
+export async function liveStatus() {
+  const res = await fetch(`${BASE}/api/live/status`);
   return res.json();
 }
