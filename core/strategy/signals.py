@@ -5,11 +5,14 @@ Port of the Pine Script crossover/crossunder logic + supply/demand zones.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 from core.strategy.indicators import (
     alma,
@@ -119,11 +122,14 @@ class SignalEngine:
 
         Walks the entire crossover history to maintain correct condition state
         (0=flat, 1=LONG, -1=SHORT).  Returns a signal only when the most recent
-        *completed* alt-TF bar triggered a condition change:
+        bar triggered a condition change:
             leTrigger AND condition[1] <= 0.0 → enter LONG
             seTrigger AND condition[1] >= 0.0 → enter SHORT
-        Incomplete alt-TF bars are excluded to match TradingView's
-        request.security() closed-bar semantics.
+
+        Matches TradingView real-time behavior: includes the forming (incomplete)
+        alt-TF bar so crossovers are detected on each base candle close, just
+        like request.security() with lookahead_on + calc_on_every_tick=false.
+        Entry price = base TF bar close (process_orders_on_close=true).
         """
         if len(df) < 50:
             return None
@@ -142,10 +148,14 @@ class SignalEngine:
 
         last = df.iloc[-1]
         symbol = str(last.get("symbol", ""))
+        # Base TF close — used as entry price (matches TV process_orders_on_close)
+        base_close = float(last["close"])
 
         # --- Determine MA series to walk ---
         if self._use_alt and self._alt_mult > 1:
-            alt_df = self._resample_ohlc(df, self._alt_mult, drop_incomplete=True)
+            # Include incomplete bar: matches TV real-time where
+            # request.security(lookahead_on) updates on each base bar close
+            alt_df = self._resample_ohlc(df, self._alt_mult, drop_incomplete=False)
 
             if len(alt_df) < max(self._ma_period + 2, 10):
                 return None
@@ -172,8 +182,9 @@ class SignalEngine:
         entry_price = 0.0
         entry_time = 0
         last_transition_idx = -1
+        n_bars = len(close_ma_vals)
 
-        for i in range(1, len(close_ma_vals)):
+        for i in range(1, n_bars):
             prev_c = close_ma_vals[i - 1]
             prev_o = open_ma_vals[i - 1]
             curr_c = close_ma_vals[i]
@@ -187,18 +198,27 @@ class SignalEngine:
 
             if le_trigger and condition <= 0.0:
                 condition = 1.0
-                entry_price = float(bar_first_closes[i])
+                # Last bar: entry at base TF close (TV process_orders_on_close)
+                # Historical: entry at first base candle close of alt-TF bar
+                # (TV lookahead_on makes value available on first bar of period)
+                if i == n_bars - 1:
+                    entry_price = base_close
+                else:
+                    entry_price = float(bar_first_closes[i])
                 entry_time = int(bar_times[i])
                 last_transition_idx = i
 
             elif se_trigger and condition >= 0.0:
                 condition = -1.0
-                entry_price = float(bar_first_closes[i])
+                if i == n_bars - 1:
+                    entry_price = base_close
+                else:
+                    entry_price = float(bar_first_closes[i])
                 entry_time = int(bar_times[i])
                 last_transition_idx = i
 
-        # Only emit signal if transition happened on the LAST completed bar
-        if last_transition_idx != len(close_ma_vals) - 1:
+        # Only emit signal if transition happened on the LAST bar
+        if last_transition_idx != n_bars - 1:
             return None
 
         if condition == 1.0 and self._trade_type in ("LONG", "BOTH"):
@@ -235,8 +255,11 @@ class SignalEngine:
           leTrigger AND condition[1] <= 0.0 → enter LONG
           seTrigger AND condition[1] >= 0.0 → enter SHORT
 
-        Walks ALL alt-TF bars chronologically so the bot starts in the same
-        position TradingView would show.
+        Uses ONLY completed alt-TF bars (drop_incomplete=True) so that
+        crossover locations are stable and match TradingView's historical
+        bar-by-bar evaluation.  Entry price = first base candle close of
+        the alt-TF bar (TV lookahead_on makes the value available from the
+        first bar of the period).
         """
         if len(df) < 50:
             return None
@@ -257,11 +280,12 @@ class SignalEngine:
         last = df.iloc[-1]
         symbol = str(last.get("symbol", ""))
 
-        # Determine which MA series to walk
-        # Use drop_incomplete=False to match TradingView's realtime behavior:
-        # request.security() updates live on the current forming HTF bar.
+        # Only completed alt-TF bars — gives stable crossover locations
+        # that match TV historical evaluation.  Forming bar is excluded
+        # to prevent phantom crossovers caused by partial data shifting
+        # MA values.
         if self._use_alt and self._alt_mult > 1:
-            alt_df = self._resample_ohlc(df, self._alt_mult, drop_incomplete=False)
+            alt_df = self._resample_ohlc(df, self._alt_mult, drop_incomplete=True)
 
             if len(alt_df) < max(self._ma_period + 2, 10):
                 # Not enough alt data
@@ -284,13 +308,14 @@ class SignalEngine:
 
         close_ma_vals = close_ma.values
         open_ma_vals = open_ma.values
+        n_bars = len(close_ma_vals)
 
         # Walk through bars chronologically, tracking condition state
         condition = 0.0  # 0=flat, 1=LONG, -1=SHORT
         entry_price = 0.0
         entry_time = 0
 
-        for i in range(1, len(close_ma_vals)):
+        for i in range(1, n_bars):
             prev_c = close_ma_vals[i - 1]
             prev_o = open_ma_vals[i - 1]
             curr_c = close_ma_vals[i]
@@ -305,6 +330,8 @@ class SignalEngine:
 
             if le_trigger and condition <= 0.0:
                 condition = 1.0
+                # TV lookahead_on: alt-TF value available from first bar
+                # of the period → entry at first base candle close
                 entry_price = float(bar_first_closes[i])
                 entry_time = int(bar_times[i])
 
@@ -315,7 +342,7 @@ class SignalEngine:
 
         # After walking all bars, emit a signal for the active position
         if condition == 1.0 and self._trade_type in ("LONG", "BOTH"):
-            return Signal(
+            sig = Signal(
                 timestamp=entry_time,
                 symbol=symbol,
                 side="LONG",
@@ -325,9 +352,14 @@ class SignalEngine:
                 supply_zones=[(z["top"], z["bottom"]) for z in self._supply_zones[:5]],
                 demand_zones=[(z["top"], z["bottom"]) for z in self._demand_zones[:5]],
             )
+            logger.info(
+                "[BACKFILL] %s LONG entry=%.4f rsi=%.2f atr=%.4f alt_bars=%d",
+                symbol, entry_price, rsi_val, atr_val, n_bars,
+            )
+            return sig
 
         if condition == -1.0 and self._trade_type in ("SHORT", "BOTH"):
-            return Signal(
+            sig = Signal(
                 timestamp=entry_time,
                 symbol=symbol,
                 side="SHORT",
@@ -337,6 +369,11 @@ class SignalEngine:
                 supply_zones=[(z["top"], z["bottom"]) for z in self._supply_zones[:5]],
                 demand_zones=[(z["top"], z["bottom"]) for z in self._demand_zones[:5]],
             )
+            logger.info(
+                "[BACKFILL] %s SHORT entry=%.4f rsi=%.2f atr=%.4f alt_bars=%d",
+                symbol, entry_price, rsi_val, atr_val, n_bars,
+            )
+            return sig
 
         return None
 

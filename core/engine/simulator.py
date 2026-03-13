@@ -67,6 +67,9 @@ class Simulator:
         )
         # Active positions: symbol → PositionState
         self._positions: dict[str, PositionState] = {}
+        # Track last processed signal timestamp per symbol to prevent
+        # reopening positions after TP/SL exit from the same signal
+        self._last_signal_ts: dict[str, int] = {}
         # Trade history
         self.trades: list[Trade] = []
         self._trade_counter = 0
@@ -85,8 +88,15 @@ class Simulator:
           leTrigger and condition[1] <= 0.0 → open LONG  (closes SHORT if any)
           seTrigger and condition[1] >= 0.0 → open SHORT (closes LONG if any)
         Same-direction signal while in position → skip (no pyramiding).
+        Duplicate signal (same timestamp) after TP/SL exit → skip (prevents
+        process_backfill from reopening a closed position).
         """
         closed_trades: list[Trade] = []
+
+        # Prevent reopening from the same signal after TP/SL exit
+        last_ts = self._last_signal_ts.get(signal.symbol, 0)
+        if signal.timestamp == last_ts and not self.has_position(signal.symbol):
+            return closed_trades
 
         if self.has_position(signal.symbol):
             existing = self._positions[signal.symbol]
@@ -105,6 +115,7 @@ class Simulator:
         pos = self._risk_mgr.open_position(signal.symbol, signal.side, signal.price)
         pos.entry_time = entry_time or signal.timestamp
         self._positions[signal.symbol] = pos
+        self._last_signal_ts[signal.symbol] = signal.timestamp
 
         # Entry fee — market order = taker fee
         notional = margin * self.wallet.leverage

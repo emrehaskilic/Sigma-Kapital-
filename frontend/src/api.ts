@@ -1,4 +1,4 @@
-const BASE = "http://localhost:8000";
+const BASE = "http://localhost:8080";
 
 export async function fetchSymbols(): Promise<{ symbols: string[]; count: number }> {
   const res = await fetch(`${BASE}/api/symbols`);

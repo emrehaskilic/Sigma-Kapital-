@@ -53,6 +53,7 @@ state: dict[str, Any] = {
 # ── WebSocket BookTicker — real-time bid/ask fed by Binance WS ──
 _ws_book_data: dict[str, dict[str, float]] = {}  # {SYMBOL: {bid, ask, bid_qty, ask_qty, time}}
 _ws_book_lock = threading.Lock()
+_sim_lock = threading.Lock()  # protects simulator reads/writes across threads
 _ws_instance: BinanceWS | None = None
 _ws_loop: asyncio.AbstractEventLoop | None = None
 
@@ -161,70 +162,81 @@ def _signal_scanner_loop() -> None:
                 last_closed = klines[-2] if len(klines) >= 2 else klines[-1]
                 klines_for_signal = klines[:-1]
 
-                # ── TP/SL check on last closed candle's high/low ──
-                if sim.has_position(sym):
-                    candle_high = float(last_closed["high"])
-                    candle_low = float(last_closed["low"])
-                    close_time = int(last_closed.get("close_time", 0))
-                    exit_trades = sim.process_candle(sym, candle_high, candle_low, close_time)
-                    for t in exit_trades:
-                        state["signal_log"].append({
-                            "time": time.strftime("%H:%M:%S"),
-                            "symbol": sym,
-                            "side": t.side,
-                            "price": t.exit_price,
-                            "rsi": 0,
-                            "source": f"EXIT_{t.exit_reason}",
-                        })
-
                 df = pd.DataFrame(klines_for_signal)
                 df["symbol"] = sym
 
-                # Use process_backfill to get the CURRENT active state
-                # (not just "did a transition happen on the last bar").
-                # This ensures we never miss a crossover even if the
-                # scanner didn't run at the exact candle boundary.
+                # Detect NEW crossovers using process() — includes forming
+                # alt-TF bar (drop_incomplete=False) to match TV real-time
+                # detection.  Only fires when transition is on the last bar.
                 engine = SignalEngine(cfg)
-                signal = engine.process_backfill(df)
+                signal = engine.process(df)
 
-                if signal:
-                    # Only act if direction differs from current position
-                    has_pos = sim.has_position(sym)
-                    if has_pos:
-                        existing = sim.positions[sym]
-                        if existing.side == signal.side:
-                            continue  # same direction — skip
-                    # New signal or reversal
-                    reversal_trades = sim.process_signal(signal)
-                    for rt in reversal_trades:
+                # All simulator mutations inside a single lock acquisition
+                with _sim_lock:
+                    # ── TP/SL check on last closed candle's high/low ──
+                    if sim.has_position(sym):
+                        candle_high = float(last_closed["high"])
+                        candle_low = float(last_closed["low"])
+                        close_time = int(last_closed.get("close_time", 0))
+                        exit_trades = sim.process_candle(sym, candle_high, candle_low, close_time)
+                        for t in exit_trades:
+                            state["signal_log"].append({
+                                "time": time.strftime("%H:%M:%S"),
+                                "symbol": sym,
+                                "side": t.side,
+                                "price": t.exit_price,
+                                "rsi": 0,
+                                "source": f"EXIT_{t.exit_reason}",
+                            })
+
+                    if signal:
+                        # Only act if direction differs from current position
+                        has_pos = sim.has_position(sym)
+                        if has_pos:
+                            existing = sim.positions[sym]
+                            if existing.side == signal.side:
+                                continue  # same direction — skip
+                        # New signal or reversal
+                        reversal_trades = sim.process_signal(signal)
+                        for rt in reversal_trades:
+                            state["signal_log"].append({
+                                "time": time.strftime("%H:%M:%S"),
+                                "symbol": sym,
+                                "side": rt.side,
+                                "price": rt.exit_price,
+                                "rsi": 0,
+                                "source": f"EXIT_{rt.exit_reason}",
+                            })
+
+                        # Log TP/SL levels for TV comparison
+                        pos = sim.positions.get(sym)
+                        if pos and pos.condition != 0.0:
+                            logger.info(
+                                "[ENTRY] %s %s @ %.4f | TP1=%.4f TP2=%.4f TP3=%.4f SL=%.4f",
+                                sym, signal.side, signal.price,
+                                pos.tp1_line, pos.tp2_line, pos.tp3_line, pos.sl_line,
+                            )
+
                         state["signal_log"].append({
                             "time": time.strftime("%H:%M:%S"),
                             "symbol": sym,
-                            "side": rt.side,
-                            "price": rt.exit_price,
-                            "rsi": 0,
-                            "source": f"EXIT_{rt.exit_reason}",
+                            "side": signal.side,
+                            "price": signal.price,
+                            "rsi": round(signal.rsi_value, 2),
+                            "source": "LIVE_SCAN",
                         })
-                    state["signal_log"].append({
-                        "time": time.strftime("%H:%M:%S"),
-                        "symbol": sym,
-                        "side": signal.side,
-                        "price": signal.price,
-                        "rsi": round(signal.rsi_value, 2),
-                        "source": "LIVE_SCAN",
-                    })
-                    logger.info("Signal scanner: %s %s @ %.4f",
-                                sym, signal.side, signal.price)
+                        logger.info("Signal scanner: %s %s @ %.4f",
+                                    sym, signal.side, signal.price)
 
-                    # Update scan_results
-                    state["scan_results"][sym] = {
-                        "status": "signal",
-                        "side": signal.side,
-                        "price": signal.price,
-                        "rsi": round(signal.rsi_value, 2),
-                        "atr": round(signal.atr_value, 4),
-                        "last_price": float(df["close"].iloc[-1]),
-                    }
+                        # Update scan_results
+                        state["scan_results"][sym] = {
+                            "status": "signal",
+                            "side": signal.side,
+                            "price": signal.price,
+                            "rsi": round(signal.rsi_value, 2),
+                            "atr": round(signal.atr_value, 4),
+                            "last_price": float(df["close"].iloc[-1]),
+                        }
 
             except Exception as e:
                 logger.error("Signal scanner error for %s: %s", sym, str(e)[:100])
@@ -320,6 +332,28 @@ def start_bot(body: dict):
                         "rsi": 0,
                         "source": f"EXIT_{rt.exit_reason}",
                     })
+
+                # Replay candles from entry to now for TP/SL catch-up
+                entry_ts = signal.timestamp
+                for _, row in df.iterrows():
+                    if int(row["open_time"]) <= entry_ts:
+                        continue
+                    if not sim.has_position(sym):
+                        break
+                    exit_trades = sim.process_candle(
+                        sym, float(row["high"]), float(row["low"]),
+                        int(row.get("close_time", row["open_time"])),
+                    )
+                    for t in exit_trades:
+                        signal_log.append({
+                            "time": time.strftime("%H:%M:%S"),
+                            "symbol": sym,
+                            "side": t.side,
+                            "price": t.exit_price,
+                            "rsi": 0,
+                            "source": f"EXIT_{t.exit_reason}",
+                        })
+
                 entry = {
                     "time": time.strftime("%H:%M:%S"),
                     "symbol": sym,
@@ -329,14 +363,33 @@ def start_bot(body: dict):
                     "source": "INITIAL_SCAN",
                 }
                 signal_log.append(entry)
-                scan_results[sym] = {
-                    "status": "signal",
-                    "side": signal.side,
-                    "price": signal.price,
-                    "rsi": round(signal.rsi_value, 2),
-                    "atr": round(signal.atr_value, 4),
-                    "last_price": last_price,
-                }
+
+                # Log TP/SL levels for TV verification
+                pos = sim.positions.get(sym)
+                if pos and pos.condition != 0.0:
+                    logger.info(
+                        "[INIT_ENTRY] %s %s @ %.4f | TP1=%.4f TP2=%.4f TP3=%.4f SL=%.4f",
+                        sym, signal.side, signal.price,
+                        pos.tp1_line, pos.tp2_line, pos.tp3_line, pos.sl_line,
+                    )
+
+                # Determine status based on whether position survived replay
+                if sim.has_position(sym):
+                    scan_results[sym] = {
+                        "status": "signal",
+                        "side": signal.side,
+                        "price": signal.price,
+                        "rsi": round(signal.rsi_value, 2),
+                        "atr": round(signal.atr_value, 4),
+                        "last_price": last_price,
+                    }
+                else:
+                    scan_results[sym] = {
+                        "status": "closed_tp",
+                        "side": signal.side,
+                        "price": signal.price,
+                        "last_price": last_price,
+                    }
             else:
                 from core.strategy.indicators import variant, rsi as calc_rsi
                 close_ma = variant(
@@ -475,12 +528,11 @@ def get_status():
     taker_fee = cfg["trading"].get("taker_fee", cfg["trading"].get("fee_rate", 0.0005))
 
     if sim:
-        # IMPORTANT: iterate over a snapshot — process_candle may delete from the dict
-        position_snapshot = list(sim.positions.items())
+        # Lock ensures scanner thread can't mutate positions mid-read
+        with _sim_lock:
+            position_snapshot = [(sym, pos) for sym, pos in sim.positions.items()
+                                 if pos.condition != 0.0]
         for sym, pos in position_snapshot:
-            if pos.condition == 0.0:
-                continue
-
             # LIVE mark price from orderbook (realistic: LONG=ask, SHORT=bid)
             ob = orderbook.get(sym)
             if ob:

@@ -79,7 +79,12 @@ class RiskManager:
         return pos
 
     def check_exits(self, pos: PositionState, high: float, low: float) -> list[ExitEvent]:
-        """Check current candle H/L against TP/SL lines. Returns exit events."""
+        """Check current candle H/L against TP/SL lines. Returns exit events.
+
+        Pine Script switch block allows only ONE state transition per bar.
+        We use elif to prevent cascading TP1→TP2→TP3 in a single candle.
+        TP takes priority over SL when both trigger on the same candle.
+        """
         exits: list[ExitEvent] = []
 
         if pos.condition == 0.0:
@@ -89,10 +94,7 @@ class RiskManager:
         price = pos.entry_price
 
         if is_long:
-            # Pine Script switch priority: TP3 → TP2 → TP1 → SL
-            # TP takes priority over SL when both trigger on the same candle.
-
-            # TP1
+            # ONE transition per bar — elif chain matches Pine Script switch
             if pos.condition == 1.0 and high >= pos.tp1_line:
                 qty_frac = self.tp1_qty / 100
                 pnl = (pos.tp1_line - price) / price * 100 * qty_frac
@@ -100,16 +102,14 @@ class RiskManager:
                 pos.condition = 1.1
                 pos.remaining_qty -= qty_frac
 
-            # TP2
-            if pos.condition == 1.1 and high >= pos.tp2_line:
+            elif pos.condition == 1.1 and high >= pos.tp2_line:
                 qty_frac = self.tp2_qty / 100
                 pnl = (pos.tp2_line - price) / price * 100 * qty_frac
                 exits.append(ExitEvent(ExitReason.TP2, pos.tp2_line, self.tp2_qty, pnl))
                 pos.condition = 1.2
                 pos.remaining_qty -= qty_frac
 
-            # TP3
-            if pos.condition == 1.2 and high >= pos.tp3_line:
+            elif pos.condition == 1.2 and high >= pos.tp3_line:
                 qty_frac = self.tp3_qty / 100
                 pnl = (pos.tp3_line - price) / price * 100 * qty_frac
                 exits.append(ExitEvent(ExitReason.TP3, pos.tp3_line, self.tp3_qty, pnl))
@@ -117,16 +117,14 @@ class RiskManager:
                 pos.remaining_qty = 0.0
 
             # Stop Loss — only if no TP was triggered this bar
-            if not exits and pos.condition >= 1.0 and low <= pos.sl_line:
+            elif pos.condition >= 1.0 and pos.condition < 1.3 and low <= pos.sl_line:
                 pnl = (pos.sl_line - price) / price * 100 * pos.remaining_qty
                 exits.append(ExitEvent(ExitReason.SL, pos.sl_line, pos.remaining_qty * 100, pnl))
                 pos.condition = 0.0
                 pos.remaining_qty = 0.0
 
         else:  # SHORT
-            # Pine Script switch priority: TP3 → TP2 → TP1 → SL
-
-            # TP1
+            # ONE transition per bar — elif chain matches Pine Script switch
             if pos.condition == -1.0 and low <= pos.tp1_line:
                 qty_frac = self.tp1_qty / 100
                 pnl = (price - pos.tp1_line) / price * 100 * qty_frac
@@ -134,16 +132,14 @@ class RiskManager:
                 pos.condition = -1.1
                 pos.remaining_qty -= qty_frac
 
-            # TP2
-            if pos.condition == -1.1 and low <= pos.tp2_line:
+            elif pos.condition == -1.1 and low <= pos.tp2_line:
                 qty_frac = self.tp2_qty / 100
                 pnl = (price - pos.tp2_line) / price * 100 * qty_frac
                 exits.append(ExitEvent(ExitReason.TP2, pos.tp2_line, self.tp2_qty, pnl))
                 pos.condition = -1.2
                 pos.remaining_qty -= qty_frac
 
-            # TP3
-            if pos.condition == -1.2 and low <= pos.tp3_line:
+            elif pos.condition == -1.2 and low <= pos.tp3_line:
                 qty_frac = self.tp3_qty / 100
                 pnl = (price - pos.tp3_line) / price * 100 * qty_frac
                 exits.append(ExitEvent(ExitReason.TP3, pos.tp3_line, self.tp3_qty, pnl))
@@ -151,7 +147,7 @@ class RiskManager:
                 pos.remaining_qty = 0.0
 
             # Stop Loss — only if no TP was triggered this bar
-            if not exits and pos.condition <= -1.0 and high >= pos.sl_line:
+            elif pos.condition <= -1.0 and pos.condition > -1.3 and high >= pos.sl_line:
                 pnl = (price - pos.sl_line) / price * 100 * pos.remaining_qty
                 exits.append(ExitEvent(ExitReason.SL, pos.sl_line, pos.remaining_qty * 100, pnl))
                 pos.condition = 0.0
