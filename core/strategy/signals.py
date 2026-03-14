@@ -126,9 +126,9 @@ class SignalEngine:
             leTrigger AND condition[1] <= 0.0 → enter LONG
             seTrigger AND condition[1] >= 0.0 → enter SHORT
 
-        Matches TradingView real-time behavior: includes the forming (incomplete)
-        alt-TF bar so crossovers are detected on each base candle close, just
-        like request.security() with lookahead_on + calc_on_every_tick=false.
+        Includes the forming (incomplete) alt-TF bar (drop_incomplete=False)
+        to match TradingView real-time behavior where request.security()
+        updates on each base candle close.
         Entry price = base TF bar close (process_orders_on_close=true).
         """
         if len(df) < 50:
@@ -153,7 +153,7 @@ class SignalEngine:
 
         # --- Determine MA series to walk ---
         if self._use_alt and self._alt_mult > 1:
-            # Include incomplete bar: matches TV real-time where
+            # Include forming bar: matches TV real-time where
             # request.security(lookahead_on) updates on each base bar close
             alt_df = self._resample_ohlc(df, self._alt_mult, drop_incomplete=False)
 

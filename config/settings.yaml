@@ -34,3 +34,8 @@ trading:
   trade_type: "BOTH"       # LONG | SHORT | BOTH
   maker_fee: 0.0002        # 0.02% maker fee (limit orders: TP/SL)
   taker_fee: 0.0005        # 0.05% taker fee (market orders: entry/reversal)
+
+protection:
+  max_drawdown_pct: 40.0       # % of initial balance — triggers circuit breaker
+  max_total_margin_pct: 70.0   # max total margin across all positions as % of balance
+  max_open_positions: 5        # max concurrent open positions

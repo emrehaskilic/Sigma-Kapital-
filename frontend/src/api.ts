@@ -85,11 +85,15 @@ export async function liveGetExchangePositions() {
   return res.json();
 }
 
-export async function liveStart(pairConfigs: Record<string, { margin: number; leverage: number }>) {
+export async function liveStart(
+  pairConfigs: Record<string, { margin: number; leverage: number }>,
+  protection?: { max_drawdown_pct: number; max_total_margin_pct: number; max_open_positions: number },
+  strategy?: { use_alternate_signals: boolean; alternate_multiplier: number },
+) {
   const res = await fetch(`${BASE}/api/live/start`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ pair_configs: pairConfigs }),
+    body: JSON.stringify({ pair_configs: pairConfigs, protection, strategy }),
   });
   return res.json();
 }
@@ -106,5 +110,28 @@ export async function liveEmergencyClose() {
 
 export async function liveStatus() {
   const res = await fetch(`${BASE}/api/live/status`);
+  return res.json();
+}
+
+export async function liveUpdateProtection(settings: {
+  max_drawdown_pct?: number;
+  max_total_margin_pct?: number;
+  max_open_positions?: number;
+}) {
+  const res = await fetch(`${BASE}/api/live/protection`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(settings),
+  });
+  return res.json();
+}
+
+export async function liveGetProtection() {
+  const res = await fetch(`${BASE}/api/live/protection`);
+  return res.json();
+}
+
+export async function liveResetCircuitBreaker() {
+  const res = await fetch(`${BASE}/api/live/reset-circuit-breaker`, { method: "POST" });
   return res.json();
 }

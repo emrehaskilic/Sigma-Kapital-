@@ -221,6 +221,39 @@ class BinanceFutures:
         )
         return result
 
+    def get_order(self, symbol: str, order_id: int) -> dict:
+        """Query a specific order to get fill details (avgPrice, status, executedQty)."""
+        return self._request("GET", "/fapi/v1/order", {
+            "symbol": symbol,
+            "orderId": order_id,
+        })
+
+    def get_order_fill_price(self, symbol: str, order_id: int, max_retries: int = 3) -> float:
+        """Poll order until FILLED and return avgPrice. Returns 0 if verification fails."""
+        for attempt in range(max_retries):
+            try:
+                order = self.get_order(symbol, order_id)
+                status = order.get("status", "")
+                avg_price = float(order.get("avgPrice", 0))
+
+                if status == "FILLED" and avg_price > 0:
+                    return avg_price
+
+                if status in ("CANCELED", "EXPIRED", "REJECTED"):
+                    logger.warning("[VERIFY] Order %s status=%s — not filled", order_id, status)
+                    return 0.0
+
+                # Still pending — wait briefly and retry
+                if attempt < max_retries - 1:
+                    import time as _time
+                    _time.sleep(0.5)
+
+            except Exception as e:
+                logger.error("[VERIFY] Failed to query order %s: %s", order_id, e)
+
+        logger.warning("[VERIFY] Order %s: could not confirm fill after %d retries", order_id, max_retries)
+        return 0.0
+
     def cancel_all_orders(self, symbol: str) -> dict:
         """Cancel all open orders for a symbol."""
         result = self._request("DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol})

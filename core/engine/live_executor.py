@@ -5,10 +5,14 @@ Same signal processing pipeline as dry-run Simulator, but:
 - SL → stop-market order on exchange (protection)
 - TP monitoring → candle-based (same as dry-run), partial close via market order
 - Per-pair config: each pair has its own margin, leverage
+- Order fill verification — polls Binance to confirm actual avgPrice
+- Account protection — max drawdown circuit breaker, max total margin check
+- Position sync — periodically reconciles with Binance exchange positions
 
 State machine:
   OBSERVING → first start, shows existing positions, waits for first signal
   ACTIVE    → after first signal, places real orders
+  STOPPED   → circuit breaker triggered, no new trades
 """
 
 from __future__ import annotations
@@ -30,6 +34,7 @@ class PairState(str, Enum):
     """Per-pair operational state."""
     OBSERVING = "OBSERVING"  # watching, not trading yet
     ACTIVE = "ACTIVE"        # live trading enabled
+    STOPPED = "STOPPED"      # circuit breaker triggered
 
 
 @dataclass
@@ -90,11 +95,29 @@ class LiveExecutor:
         # Wallet tracking (from Binance)
         self.balance: float = 0.0
         self.available_balance: float = 0.0
+        self._initial_balance: float = 0.0  # captured on first refresh
 
         # Fee rates (for PnL estimation before fills arrive)
         trading = config.get("trading", {})
         self._maker_fee = trading.get("maker_fee", 0.0002)
         self._taker_fee = trading.get("taker_fee", 0.0005)
+
+        # ── Account Protection ──
+        protection = config.get("protection", {})
+        # Max drawdown as % of initial balance — triggers circuit breaker
+        self._max_drawdown_pct: float = protection.get("max_drawdown_pct", 10.0)
+        # Max total margin across all open positions as % of balance
+        self._max_total_margin_pct: float = protection.get("max_total_margin_pct", 50.0)
+        # Max concurrent open positions
+        self._max_open_positions: int = protection.get("max_open_positions", 5)
+        # Circuit breaker state
+        self.circuit_breaker_triggered: bool = False
+        self.circuit_breaker_reason: str = ""
+
+        # ── Position Sync ──
+        self._last_sync_ts: float = 0.0
+        self._sync_interval: float = 60.0  # seconds between syncs
+        self.sync_warnings: list[str] = []  # drift log for frontend
 
         # Stats
         self.total_trades: int = 0
@@ -137,6 +160,9 @@ class LiveExecutor:
         bal = self._client.get_balance()
         self.balance = bal["balance"]
         self.available_balance = bal["available"]
+        # Capture initial balance on first call (for drawdown calc)
+        if self._initial_balance == 0.0 and self.balance > 0:
+            self._initial_balance = self.balance
         return bal
 
     def load_exchange_positions(self) -> list[dict[str, Any]]:
@@ -160,6 +186,243 @@ class LiveExecutor:
         """Transition pair from OBSERVING to ACTIVE."""
         self._pair_states[symbol] = PairState.ACTIVE
         logger.info("[STATE] %s → ACTIVE (live trading enabled)", symbol)
+
+    # ------------------------------------------------------------------
+    # Order Fill Verification
+    # ------------------------------------------------------------------
+
+    def _verify_fill(self, symbol: str, result: dict, fallback_price: float) -> float:
+        """Verify order fill price from Binance. Returns actual avgPrice.
+
+        1. Check avgPrice in order response
+        2. If missing/zero, poll order by orderId
+        3. Last resort: use fallback_price and log warning
+        """
+        # Step 1: Check immediate response
+        avg_price = float(result.get("avgPrice", 0))
+        if avg_price > 0:
+            return avg_price
+
+        # Step 2: Poll order for fill confirmation
+        order_id = result.get("orderId")
+        if order_id:
+            verified_price = self._client.get_order_fill_price(symbol, int(order_id))
+            if verified_price > 0:
+                return verified_price
+
+        # Step 3: Fallback — log warning
+        logger.warning(
+            "[FILL] Could not verify fill for %s orderId=%s — using fallback %.4f",
+            symbol, result.get("orderId"), fallback_price,
+        )
+        return fallback_price
+
+    # ------------------------------------------------------------------
+    # Account Protection
+    # ------------------------------------------------------------------
+
+    def _check_account_protection(self, symbol: str) -> str | None:
+        """Check account protection rules before opening a new position.
+
+        Returns None if OK, or a reason string if blocked.
+        """
+        # Circuit breaker already triggered
+        if self.circuit_breaker_triggered:
+            return f"Circuit breaker active: {self.circuit_breaker_reason}"
+
+        # 1. Max drawdown check
+        if self._initial_balance > 0:
+            drawdown_pct = (self._initial_balance - self.balance) / self._initial_balance * 100
+            if drawdown_pct >= self._max_drawdown_pct:
+                self.circuit_breaker_triggered = True
+                self.circuit_breaker_reason = (
+                    f"Max drawdown {self._max_drawdown_pct}% reached "
+                    f"(current: {drawdown_pct:.2f}%)"
+                )
+                logger.critical("[PROTECTION] %s", self.circuit_breaker_reason)
+                return self.circuit_breaker_reason
+
+        # 2. Max concurrent positions check
+        open_count = sum(
+            1 for pos in self._positions.values() if pos.condition != 0.0
+        )
+        if open_count >= self._max_open_positions:
+            reason = (
+                f"Max open positions ({self._max_open_positions}) reached — "
+                f"currently {open_count} open"
+            )
+            logger.warning("[PROTECTION] %s — skipping %s", reason, symbol)
+            return reason
+
+        # 3. Max total margin check
+        pc = self._pair_configs.get(symbol)
+        if pc and self._initial_balance > 0:
+            # Sum margin of all open positions + this new one
+            total_margin = pc.margin  # the new trade
+            for sym, pos in self._positions.items():
+                if pos.condition != 0.0:
+                    sym_pc = self._pair_configs.get(sym)
+                    if sym_pc:
+                        total_margin += sym_pc.margin * pos.remaining_qty
+
+            margin_pct = total_margin / self._initial_balance * 100
+            if margin_pct > self._max_total_margin_pct:
+                reason = (
+                    f"Total margin {margin_pct:.1f}% exceeds limit "
+                    f"{self._max_total_margin_pct}% — skipping {symbol}"
+                )
+                logger.warning("[PROTECTION] %s", reason)
+                return reason
+
+        return None
+
+    def reset_circuit_breaker(self) -> None:
+        """Manually reset the circuit breaker (after user review)."""
+        self.circuit_breaker_triggered = False
+        self.circuit_breaker_reason = ""
+        logger.info("[PROTECTION] Circuit breaker manually reset")
+
+    # ------------------------------------------------------------------
+    # Position Sync — reconcile with Binance exchange
+    # ------------------------------------------------------------------
+
+    def sync_positions(self) -> list[str]:
+        """Compare bot's position tracking with actual Binance positions.
+
+        Returns list of warning messages about any drift detected.
+        """
+        now = time.time()
+        if now - self._last_sync_ts < self._sync_interval:
+            return []
+        self._last_sync_ts = now
+
+        warnings: list[str] = []
+
+        try:
+            exchange_positions = self._client.get_positions()
+        except Exception as e:
+            msg = f"[SYNC] Failed to fetch exchange positions: {e}"
+            logger.error(msg)
+            warnings.append(msg)
+            return warnings
+
+        # Build lookup: symbol → exchange position
+        exchange_map: dict[str, dict] = {}
+        for ep in exchange_positions:
+            exchange_map[ep["symbol"]] = ep
+
+        # Check 1: Bot thinks position is open, but exchange says closed
+        for sym in list(self._positions.keys()):
+            pos = self._positions[sym]
+            if pos.condition == 0.0:
+                continue  # bot already knows it's closed
+
+            if sym not in exchange_map:
+                # Position closed externally (manually, liquidation, etc.)
+                msg = (
+                    f"[SYNC] {sym} {pos.side}: bot has open position but "
+                    f"exchange shows no position — marking as closed"
+                )
+                logger.warning(msg)
+                warnings.append(msg)
+
+                # Clean up SL orders
+                old_sl = self._sl_order_ids.get(sym)
+                if old_sl:
+                    try:
+                        self._client.cancel_order(sym, old_sl)
+                    except Exception:
+                        pass
+
+                # Mark closed in bot state
+                pos.condition = 0.0
+                pos.remaining_qty = 0.0
+                self._position_qty.pop(sym, None)
+                self._sl_order_ids.pop(sym, None)
+                continue
+
+            # Check 2: Position exists on both, but quantity drifted
+            ep = exchange_map[sym]
+            exchange_qty = ep["amount"]
+            bot_qty = self._position_qty.get(sym, 0)
+
+            if bot_qty > 0 and abs(exchange_qty - bot_qty) / bot_qty > 0.01:
+                msg = (
+                    f"[SYNC] {sym}: qty drift detected — "
+                    f"bot={bot_qty:.6f} exchange={exchange_qty:.6f}"
+                )
+                logger.warning(msg)
+                warnings.append(msg)
+                # Update bot qty to match exchange
+                self._position_qty[sym] = exchange_qty
+
+            # Check 3: Side mismatch
+            if ep["side"] != pos.side:
+                msg = (
+                    f"[SYNC] {sym}: side mismatch — "
+                    f"bot={pos.side} exchange={ep['side']}"
+                )
+                logger.warning(msg)
+                warnings.append(msg)
+                # This is a critical mismatch — close the bot's position tracking
+                pos.condition = 0.0
+                pos.remaining_qty = 0.0
+                self._position_qty.pop(sym, None)
+                self._sl_order_ids.pop(sym, None)
+
+        # Check 4: Exchange has position that bot doesn't know about
+        for sym, ep in exchange_map.items():
+            if sym not in self._pair_configs:
+                continue  # not a pair we're trading
+            bot_pos = self._positions.get(sym)
+            if bot_pos is None or bot_pos.condition == 0.0:
+                msg = (
+                    f"[SYNC] {sym} {ep['side']}: exchange has position "
+                    f"(qty={ep['amount']:.6f}) but bot has none — "
+                    f"external position, not managed"
+                )
+                logger.warning(msg)
+                warnings.append(msg)
+
+        # Check 5: Verify SL orders still exist on exchange
+        for sym, sl_id in list(self._sl_order_ids.items()):
+            if not self.has_position(sym):
+                continue
+            try:
+                order = self._client.get_order(sym, sl_id)
+                status = order.get("status", "")
+                if status in ("CANCELED", "EXPIRED", "FILLED"):
+                    if status == "FILLED":
+                        msg = f"[SYNC] {sym}: SL order {sl_id} already FILLED on exchange"
+                        logger.info(msg)
+                        warnings.append(msg)
+                    else:
+                        msg = (
+                            f"[SYNC] {sym}: SL order {sl_id} is {status} — "
+                            f"re-placing SL for protection"
+                        )
+                        logger.warning(msg)
+                        warnings.append(msg)
+                        # Re-place SL
+                        pos = self._positions.get(sym)
+                        qty = self._position_qty.get(sym, 0)
+                        if pos and qty > 0:
+                            self._place_sl_order(sym, pos, qty)
+            except Exception as e:
+                logger.error("[SYNC] Failed to check SL order %s for %s: %s", sl_id, sym, e)
+
+        if warnings:
+            self.sync_warnings.extend(warnings)
+            # Keep last 50 warnings
+            self.sync_warnings = self.sync_warnings[-50:]
+
+        # Also refresh balance during sync
+        try:
+            self.refresh_balance()
+        except Exception:
+            pass
+
+        return warnings
 
     # ------------------------------------------------------------------
     # Signal Processing (same logic as Simulator)
@@ -193,8 +456,13 @@ class LiveExecutor:
             # Opposite direction — close existing (reversal)
             closed_trades.extend(self._close_position(symbol, signal.price))
 
-        # Check balance
+        # ── Account protection checks ──
         self.refresh_balance()
+        block_reason = self._check_account_protection(symbol)
+        if block_reason:
+            logger.warning("[SIGNAL] Blocked for %s: %s", symbol, block_reason)
+            return closed_trades
+
         if self.available_balance < pc.margin:
             logger.warning(
                 "[SIGNAL] Insufficient balance for %s: need %.2f, have %.2f",
@@ -208,13 +476,11 @@ class LiveExecutor:
             logger.warning("[SIGNAL] Calculated qty=0 for %s — skipping", symbol)
             return closed_trades
 
-        # Place market order
+        # Place market order + verify fill
         order_side = "BUY" if signal.side == "LONG" else "SELL"
         try:
             result = self._client.market_order(symbol, order_side, qty)
-            fill_price = float(result.get("avgPrice", signal.price))
-            if fill_price == 0:
-                fill_price = signal.price
+            fill_price = self._verify_fill(symbol, result, signal.price)
         except Exception as e:
             logger.error("[ORDER] Market order failed for %s: %s", symbol, e)
             return closed_trades
@@ -231,7 +497,7 @@ class LiveExecutor:
 
         # Entry fee estimation
         notional = qty * fill_price
-        entry_fee = notional * self._taker_fee
+        entry_fee = notional * self._maker_fee
         self.total_fees += entry_fee
 
         logger.info(
@@ -285,14 +551,12 @@ class LiveExecutor:
         except Exception as e:
             logger.error("[CLOSE] Failed to cancel orders for %s: %s", symbol, e)
 
-        # Place market close order
+        # Place market close order + verify fill
         close_side = "SELL" if pos.side == "LONG" else "BUY"
         actual_qty = qty * pos.remaining_qty
         try:
             result = self._client.market_order(symbol, close_side, actual_qty, reduce_only=True)
-            fill_price = float(result.get("avgPrice", exit_price))
-            if fill_price == 0:
-                fill_price = exit_price
+            fill_price = self._verify_fill(symbol, result, exit_price)
         except Exception as e:
             logger.error("[CLOSE] Market close failed for %s: %s", symbol, e)
             fill_price = exit_price
@@ -308,7 +572,7 @@ class LiveExecutor:
             pnl_pct = (pos.entry_price - fill_price) / pos.entry_price * 100
 
         pnl_usdt = notional * pnl_pct / 100
-        exit_fee = actual_qty * fill_price * self._taker_fee
+        exit_fee = actual_qty * fill_price * self._maker_fee
 
         self._update_stats(pnl_usdt, exit_fee)
 
@@ -390,11 +654,11 @@ class LiveExecutor:
             except Exception:
                 pass
         else:
-            # TP exit — send market close order for partial qty
+            # TP exit — send market close order for partial qty + verify fill
             close_side = "SELL" if pos.side == "LONG" else "BUY"
             try:
                 result = self._client.market_order(symbol, close_side, exit_qty, reduce_only=True)
-                actual_price = float(result.get("avgPrice", exit_ev.price))
+                actual_price = self._verify_fill(symbol, result, exit_ev.price)
                 if actual_price > 0:
                     exit_ev = ExitEvent(exit_ev.reason, actual_price, exit_ev.qty_percent, exit_ev.pnl)
             except Exception as e:
@@ -465,8 +729,14 @@ class LiveExecutor:
             if self.total_trades > 0
             else 0
         )
+        drawdown_pct = 0.0
+        if self._initial_balance > 0:
+            drawdown_pct = (self._initial_balance - self.balance) / self._initial_balance * 100
+
+        open_count = sum(1 for pos in self._positions.values() if pos.condition != 0.0)
+
         return {
-            "initial_balance": self.balance,
+            "initial_balance": round(self._initial_balance, 2),
             "current_balance": round(self.balance, 2),
             "total_pnl": round(self.total_pnl, 2),
             "total_pnl_pct": 0,
@@ -478,6 +748,14 @@ class LiveExecutor:
             "maker_fees": 0,
             "taker_fees": 0,
             "leverage": 0,
+            # Protection stats
+            "drawdown_pct": round(drawdown_pct, 2),
+            "max_drawdown_limit": self._max_drawdown_pct,
+            "open_positions": open_count,
+            "max_open_positions": self._max_open_positions,
+            "circuit_breaker": self.circuit_breaker_triggered,
+            "circuit_breaker_reason": self.circuit_breaker_reason,
+            "sync_warnings": self.sync_warnings[-10:],
         }
 
     def get_pair_state(self, symbol: str) -> str:
@@ -485,12 +763,32 @@ class LiveExecutor:
         return self._pair_states.get(symbol, PairState.OBSERVING).value
 
     def emergency_close_all(self) -> list[LiveTrade]:
-        """Emergency: close all positions immediately."""
+        """Emergency: close all positions immediately.
+
+        Fetches real-time prices from Binance book ticker for accurate PnL.
+        Falls back to entry price only if price fetch fails.
+        """
         all_trades: list[LiveTrade] = []
+
+        # Try to get current prices for all symbols at once
+        current_prices: dict[str, float] = {}
+        for symbol in list(self._positions.keys()):
+            if not self.has_position(symbol):
+                continue
+            try:
+                # Use bookTicker for fastest price
+                ticker = self._client._request(
+                    "GET", "/fapi/v1/ticker/price",
+                    {"symbol": symbol}, signed=False,
+                )
+                current_prices[symbol] = float(ticker.get("price", 0))
+            except Exception:
+                pass
+
         for symbol in list(self._positions.keys()):
             if self.has_position(symbol):
                 pos = self._positions[symbol]
-                # Use entry price as estimate — actual fill will differ
-                trades = self._close_position(symbol, pos.entry_price)
+                price = current_prices.get(symbol) or pos.entry_price
+                trades = self._close_position(symbol, price)
                 all_trades.extend(trades)
         return all_trades

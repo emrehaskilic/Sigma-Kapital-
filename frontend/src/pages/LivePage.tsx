@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import {
   fetchSymbols,
+  fetchConfig,
   liveSetKeys,
   liveGetBalance,
   liveStart,
@@ -8,6 +9,8 @@ import {
   liveStatus,
   liveEmergencyClose,
   liveGetExchangePositions,
+  liveUpdateProtection,
+  liveResetCircuitBreaker,
 } from "../api";
 import { MetricTile } from "../components/MetricTile";
 import { Badge } from "../components/Badge";
@@ -39,6 +42,15 @@ export default function LivePage() {
   const [pairConfigs, setPairConfigs] = useState<Record<string, PairConfig>>({});
   const [searchQuery, setSearchQuery] = useState("");
 
+  // Strategy settings
+  const [useAlternateSignals, setUseAlternateSignals] = useState(true);
+  const [alternateMultiplier, setAlternateMultiplier] = useState(8);
+
+  // Protection settings
+  const [maxDrawdown, setMaxDrawdown] = useState(40);
+  const [maxMarginPct, setMaxMarginPct] = useState(70);
+  const [maxPositions, setMaxPositions] = useState(5);
+
   // Live state
   const [liveRunning, setLiveRunning] = useState(false);
   const [status, setStatus] = useState<any>(null);
@@ -46,9 +58,15 @@ export default function LivePage() {
   const [exchangePositions, setExchangePositions] = useState<any[]>([]);
   const pollRef = useRef<number | null>(null);
 
-  // Load symbols on mount
+  // Load symbols and config on mount
   useEffect(() => {
     fetchSymbols().then((d) => setAllSymbols(d.symbols));
+    fetchConfig().then((cfg) => {
+      if (cfg?.strategy) {
+        setUseAlternateSignals(cfg.strategy.use_alternate_signals ?? true);
+        setAlternateMultiplier(cfg.strategy.alternate_multiplier ?? 8);
+      }
+    });
   }, []);
 
   // Poll live status
@@ -124,7 +142,14 @@ export default function LivePage() {
       setExchangePositions(posRes.positions);
     }
 
-    const res = await liveStart(pairConfigs);
+    const res = await liveStart(pairConfigs, {
+      max_drawdown_pct: maxDrawdown,
+      max_total_margin_pct: maxMarginPct,
+      max_open_positions: maxPositions,
+    }, {
+      use_alternate_signals: useAlternateSignals,
+      alternate_multiplier: alternateMultiplier,
+    });
     if (res.error) {
       setKeysError(res.error);
       setLoading(false);
@@ -144,6 +169,18 @@ export default function LivePage() {
     if (!confirm("TUM POZISYONLARI KAPATMAK ISTEDIGINIZE EMIN MISINIZ?")) return;
     const res = await liveEmergencyClose();
     alert(`${res.trades_closed || 0} pozisyon kapatildi.`);
+  };
+
+  const handleUpdateProtection = async () => {
+    await liveUpdateProtection({
+      max_drawdown_pct: maxDrawdown,
+      max_total_margin_pct: maxMarginPct,
+      max_open_positions: maxPositions,
+    });
+  };
+
+  const handleResetCircuitBreaker = async () => {
+    await liveResetCircuitBreaker();
   };
 
   // Filtered symbols for search
@@ -264,6 +301,31 @@ export default function LivePage() {
           </div>
         )}
 
+        {/* ── Strategy Settings ── */}
+        {keysValid && !liveRunning && (
+          <div className="bg-[#131d2a]/80 rounded-xl border border-slate-700/20 p-4 space-y-3">
+            <h2 className="text-sm font-semibold text-slate-300">Strateji Ayarlari</h2>
+            <div className="flex items-center gap-4">
+              <label className="space-y-0.5 flex flex-col">
+                <span className="text-slate-500 text-[10px] uppercase">Alternate Signals</span>
+                <div className="flex items-center gap-2 h-[30px]">
+                  <input type="checkbox"
+                    checked={useAlternateSignals}
+                    onChange={(e) => setUseAlternateSignals(e.target.checked)}
+                    className="w-4 h-4 accent-sky-500 bg-[#0b1217] border-slate-700/30 rounded" />
+                  <span className="text-slate-400 text-[11px]">{useAlternateSignals ? "ON" : "OFF"}</span>
+                  {useAlternateSignals && (
+                    <input type="number" step="1" min="1"
+                      value={alternateMultiplier}
+                      onChange={(e) => setAlternateMultiplier(+e.target.value)}
+                      className="w-12 bg-[#0b1217] border border-slate-700/30 rounded px-1.5 py-0.5 text-xs font-mono text-slate-200" />
+                  )}
+                </div>
+              </label>
+            </div>
+          </div>
+        )}
+
         {/* ── Pair Selection & Config ── */}
         {keysValid && !liveRunning && (
           <div className="bg-[#131d2a]/80 rounded-xl border border-slate-700/20 p-4 space-y-4">
@@ -335,6 +397,109 @@ export default function LivePage() {
                     })}
                   </tbody>
                 </table>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ── Account Protection Settings ── */}
+        {keysValid && (
+          <div className="bg-[#131d2a]/80 rounded-xl border border-amber-500/20 p-4 space-y-3">
+            <div className="flex items-center justify-between">
+              <h2 className="text-sm font-semibold text-amber-400">Hesap Koruma Ayarlari</h2>
+              {liveRunning && (
+                <button onClick={handleUpdateProtection}
+                  className="px-3 py-1 rounded-lg text-[10px] font-semibold bg-amber-500/15 text-amber-400 border border-amber-500/25 hover:bg-amber-500/25 transition-colors">
+                  Guncelle
+                </button>
+              )}
+            </div>
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+              <label className="space-y-1">
+                <span className="text-slate-400 text-[10px] uppercase">Max Drawdown (%)</span>
+                <div className="flex items-center gap-2">
+                  <input type="range" min="5" max="80" step="5"
+                    value={maxDrawdown}
+                    onChange={(e) => setMaxDrawdown(+e.target.value)}
+                    className="flex-1 accent-amber-500 h-1.5" />
+                  <input type="number" min="5" max="80" step="5"
+                    value={maxDrawdown}
+                    onChange={(e) => setMaxDrawdown(+e.target.value)}
+                    className="w-16 bg-[#0b1217] border border-slate-700/30 rounded px-2 py-1 text-center text-xs font-mono text-amber-400" />
+                </div>
+                <span className="text-[9px] text-slate-500">Bakiye %{maxDrawdown} duserse yeni islem durdurulur</span>
+              </label>
+              <label className="space-y-1">
+                <span className="text-slate-400 text-[10px] uppercase">Max Toplam Margin (%)</span>
+                <div className="flex items-center gap-2">
+                  <input type="range" min="10" max="100" step="5"
+                    value={maxMarginPct}
+                    onChange={(e) => setMaxMarginPct(+e.target.value)}
+                    className="flex-1 accent-amber-500 h-1.5" />
+                  <input type="number" min="10" max="100" step="5"
+                    value={maxMarginPct}
+                    onChange={(e) => setMaxMarginPct(+e.target.value)}
+                    className="w-16 bg-[#0b1217] border border-slate-700/30 rounded px-2 py-1 text-center text-xs font-mono text-amber-400" />
+                </div>
+                <span className="text-[9px] text-slate-500">Tum pozisyonlarin toplam margin'i bakiyenin %{maxMarginPct}'ini asamaz</span>
+              </label>
+              <label className="space-y-1">
+                <span className="text-slate-400 text-[10px] uppercase">Max Acik Pozisyon</span>
+                <div className="flex items-center gap-2">
+                  <input type="range" min="1" max="20" step="1"
+                    value={maxPositions}
+                    onChange={(e) => setMaxPositions(+e.target.value)}
+                    className="flex-1 accent-amber-500 h-1.5" />
+                  <input type="number" min="1" max="20" step="1"
+                    value={maxPositions}
+                    onChange={(e) => setMaxPositions(+e.target.value)}
+                    className="w-16 bg-[#0b1217] border border-slate-700/30 rounded px-2 py-1 text-center text-xs font-mono text-amber-400" />
+                </div>
+                <span className="text-[9px] text-slate-500">Ayni anda en fazla {maxPositions} pozisyon acik olabilir</span>
+              </label>
+            </div>
+
+            {/* Circuit Breaker Alert */}
+            {liveRunning && stats?.circuit_breaker && (
+              <div className="mt-2 bg-red-500/10 border border-red-500/30 rounded-lg p-3 flex items-center justify-between">
+                <div>
+                  <span className="text-xs font-semibold text-red-400">CIRCUIT BREAKER AKTIF</span>
+                  <p className="text-[10px] text-red-300 mt-0.5">{stats.circuit_breaker_reason}</p>
+                </div>
+                <button onClick={handleResetCircuitBreaker}
+                  className="px-3 py-1.5 rounded-lg text-[10px] font-semibold bg-red-500/15 text-red-400 border border-red-500/25 hover:bg-red-500/25 transition-colors">
+                  Sifirla
+                </button>
+              </div>
+            )}
+
+            {/* Live Protection Stats */}
+            {liveRunning && stats && (
+              <div className="grid grid-cols-3 gap-2 mt-2">
+                <div className="bg-[#0b1217]/60 rounded-lg px-3 py-2 text-center">
+                  <div className="text-[9px] text-slate-500 uppercase">Drawdown</div>
+                  <div className={`text-sm font-mono font-semibold ${
+                    stats.drawdown_pct > maxDrawdown * 0.7 ? "text-red-400" : "text-slate-200"
+                  }`}>
+                    %{formatNum(stats.drawdown_pct, 1)} <span className="text-[9px] text-slate-500">/ %{maxDrawdown}</span>
+                  </div>
+                </div>
+                <div className="bg-[#0b1217]/60 rounded-lg px-3 py-2 text-center">
+                  <div className="text-[9px] text-slate-500 uppercase">Acik Pozisyon</div>
+                  <div className={`text-sm font-mono font-semibold ${
+                    stats.open_positions >= maxPositions ? "text-red-400" : "text-slate-200"
+                  }`}>
+                    {stats.open_positions} <span className="text-[9px] text-slate-500">/ {maxPositions}</span>
+                  </div>
+                </div>
+                <div className="bg-[#0b1217]/60 rounded-lg px-3 py-2 text-center">
+                  <div className="text-[9px] text-slate-500 uppercase">Sync Uyarilari</div>
+                  <div className={`text-sm font-mono font-semibold ${
+                    (stats.sync_warnings?.length || 0) > 0 ? "text-yellow-400" : "text-slate-200"
+                  }`}>
+                    {stats.sync_warnings?.length || 0}
+                  </div>
+                </div>
               </div>
             )}
           </div>

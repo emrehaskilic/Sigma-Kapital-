@@ -913,6 +913,37 @@ def _live_signal_scanner_loop() -> None:
         if not executor:
             continue
 
+        # ── Position Sync — reconcile with exchange every ~60s ──
+        with _live_lock:
+            sync_warnings = executor.sync_positions()
+            if sync_warnings:
+                for w in sync_warnings:
+                    _live_state["signal_log"].append({
+                        "time": time.strftime("%H:%M:%S"),
+                        "symbol": "SYSTEM",
+                        "side": "SYNC",
+                        "price": 0,
+                        "rsi": 0,
+                        "source": w,
+                    })
+
+            # ── Circuit breaker check ──
+            if executor.circuit_breaker_triggered:
+                logger.critical(
+                    "[LIVE] Circuit breaker triggered: %s — stopping new entries",
+                    executor.circuit_breaker_reason,
+                )
+                _live_state["signal_log"].append({
+                    "time": time.strftime("%H:%M:%S"),
+                    "symbol": "SYSTEM",
+                    "side": "STOP",
+                    "price": 0,
+                    "rsi": 0,
+                    "source": f"CIRCUIT_BREAKER: {executor.circuit_breaker_reason}",
+                })
+                # Don't stop scanning (SL still needs monitoring), but no new entries
+                # The circuit breaker inside process_signal will block new entries
+
         rest: BinanceRest = state["rest"]
 
         for sym in list(_live_state["active_symbols"]):
@@ -1058,9 +1089,23 @@ def live_start(body: dict):
 
     cfg = state["config"]
 
+    # Apply frontend strategy overrides if provided
+    strategy_overrides = body.get("strategy", {})
+    if strategy_overrides:
+        cfg["strategy"].update(strategy_overrides)
+
     # Create Binance client and LiveExecutor
     client = BinanceFutures(api_key, api_secret, testnet=_live_state.get("testnet", False))
     executor = LiveExecutor(client, cfg)
+
+    # Apply frontend protection overrides if provided
+    protection = body.get("protection", {})
+    if "max_drawdown_pct" in protection:
+        executor._max_drawdown_pct = float(protection["max_drawdown_pct"])
+    if "max_total_margin_pct" in protection:
+        executor._max_total_margin_pct = float(protection["max_total_margin_pct"])
+    if "max_open_positions" in protection:
+        executor._max_open_positions = int(protection["max_open_positions"])
 
     # Configure each pair
     symbols = []
@@ -1197,6 +1242,69 @@ def live_stop():
     return {"status": "stopped"}
 
 
+@app.post("/api/live/protection")
+def live_update_protection(body: dict):
+    """Update account protection settings at runtime.
+
+    Body: {max_drawdown_pct: 40, max_total_margin_pct: 70, max_open_positions: 5}
+    """
+    executor: LiveExecutor | None = _live_state.get("executor")
+    if not executor:
+        return {"error": "No live executor"}
+
+    with _live_lock:
+        if "max_drawdown_pct" in body:
+            executor._max_drawdown_pct = float(body["max_drawdown_pct"])
+        if "max_total_margin_pct" in body:
+            executor._max_total_margin_pct = float(body["max_total_margin_pct"])
+        if "max_open_positions" in body:
+            executor._max_open_positions = int(body["max_open_positions"])
+
+    return {
+        "status": "ok",
+        "max_drawdown_pct": executor._max_drawdown_pct,
+        "max_total_margin_pct": executor._max_total_margin_pct,
+        "max_open_positions": executor._max_open_positions,
+    }
+
+
+@app.get("/api/live/protection")
+def live_get_protection():
+    """Get current protection settings."""
+    executor: LiveExecutor | None = _live_state.get("executor")
+    if executor:
+        return {
+            "max_drawdown_pct": executor._max_drawdown_pct,
+            "max_total_margin_pct": executor._max_total_margin_pct,
+            "max_open_positions": executor._max_open_positions,
+            "circuit_breaker": executor.circuit_breaker_triggered,
+            "circuit_breaker_reason": executor.circuit_breaker_reason,
+        }
+    # Fallback to config defaults
+    cfg = state["config"]
+    prot = cfg.get("protection", {})
+    return {
+        "max_drawdown_pct": prot.get("max_drawdown_pct", 40.0),
+        "max_total_margin_pct": prot.get("max_total_margin_pct", 70.0),
+        "max_open_positions": prot.get("max_open_positions", 5),
+        "circuit_breaker": False,
+        "circuit_breaker_reason": "",
+    }
+
+
+@app.post("/api/live/reset-circuit-breaker")
+def live_reset_circuit_breaker():
+    """Manually reset the circuit breaker after user review."""
+    executor: LiveExecutor | None = _live_state.get("executor")
+    if not executor:
+        return {"error": "No live executor"}
+
+    with _live_lock:
+        executor.reset_circuit_breaker()
+
+    return {"status": "reset", "circuit_breaker": False}
+
+
 @app.post("/api/live/emergency-close")
 def live_emergency_close():
     """Emergency: close all positions immediately."""
@@ -1251,13 +1359,16 @@ def live_status():
         for sym, ob in orderbook.items():
             live_prices[sym] = (ob["bid"] + ob["ask"]) / 2
 
-    # Positions with live PnL
+    # Positions with live PnL (thread-safe snapshot)
     positions = []
     with _live_lock:
         position_snapshot = [
             (sym, pos) for sym, pos in executor.positions.items()
             if pos.condition != 0.0
         ]
+        scan_results_snapshot = dict(_live_state.get("scan_results", {}))
+        signal_log_snapshot = list(_live_state.get("signal_log", []))[-50:]
+        stats = executor.get_stats()
 
     for sym, pos in position_snapshot:
         pc = _live_state["pair_configs"].get(sym, {})
@@ -1318,7 +1429,7 @@ def live_status():
         current_price = live_prices.get(sym, 0)
 
         ob = orderbook.get(sym, {})
-        scan = _live_state["scan_results"].get(sym, {})
+        scan = scan_results_snapshot.get(sym, {})
         pair_summaries[sym] = {
             "last_price": round(current_price, 4),
             "bid": round(ob.get("bid", current_price), 4),
@@ -1336,7 +1447,6 @@ def live_status():
             "pair_state": executor.get_pair_state(sym),
         }
 
-    stats = executor.get_stats()
     total_unrealized = sum(p["unrealized_pnl_usdt"] for p in positions)
 
     return {
@@ -1347,7 +1457,7 @@ def live_status():
         "stats": stats,
         "positions": positions,
         "pair_summaries": pair_summaries,
-        "signal_log": _live_state["signal_log"][-50:],
+        "signal_log": signal_log_snapshot,
         "trade_log": [
             {
                 "id": t.id,

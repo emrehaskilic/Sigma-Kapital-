@@ -338,12 +338,21 @@ export default function BacktestPage() {
                     onChange={(e) => handleConfigChange("strategy", "ma_period", +e.target.value)}
                     className="w-full bg-[#0b1217] border border-slate-700/30 rounded-lg px-2 py-1 text-sm font-mono text-slate-200" />
                 </label>
-                <label className="space-y-1">
-                  <span className="text-slate-500 text-[10px] uppercase">Multiplier</span>
-                  <input type="number" step="1" min="1"
-                    value={config.strategy.alternate_multiplier}
-                    onChange={(e) => handleConfigChange("strategy", "alternate_multiplier", +e.target.value)}
-                    className="w-full bg-[#0b1217] border border-slate-700/30 rounded-lg px-2 py-1 text-sm font-mono text-slate-200" />
+                <label className="space-y-1 flex flex-col">
+                  <span className="text-slate-500 text-[10px] uppercase">Alternate Signals</span>
+                  <div className="flex items-center gap-2 h-[30px]">
+                    <input type="checkbox"
+                      checked={config.strategy.use_alternate_signals}
+                      onChange={(e) => handleConfigChange("strategy", "use_alternate_signals", e.target.checked)}
+                      className="w-4 h-4 accent-sky-500 bg-[#0b1217] border-slate-700/30 rounded" />
+                    <span className="text-slate-400 text-[11px]">{config.strategy.use_alternate_signals ? "ON" : "OFF"}</span>
+                    {config.strategy.use_alternate_signals && (
+                      <input type="number" step="1" min="1"
+                        value={config.strategy.alternate_multiplier}
+                        onChange={(e) => handleConfigChange("strategy", "alternate_multiplier", +e.target.value)}
+                        className="w-12 bg-[#0b1217] border border-slate-700/30 rounded px-1.5 py-0.5 text-xs font-mono text-slate-200" />
+                    )}
+                  </div>
                 </label>
                 <label className="space-y-1">
                   <span className="text-slate-500 text-[10px] uppercase">ALMA Sigma</span>

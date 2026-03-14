@@ -71,25 +71,26 @@ class Backtester:
         if not all_dfs:
             return BacktestResult([], [], [], self._empty_metrics(), [])
 
-        # 2. Compute signal timelines
-        self._status = "computing"
-        self._progress = 25.0
-        signal_timelines: dict[str, dict[int, Signal]] = {}
-        for i, (sym, df) in enumerate(all_dfs.items()):
-            self._progress = 25 + (i / len(all_dfs)) * 15
-            signal_timelines[sym] = self._compute_signal_timeline(df)
-            logger.info("Backtest: %s — %d signals", sym, len(signal_timelines[sym]))
-
-        # 3. Walk candles chronologically
+        # 2. Candle-by-candle simulation — uses the SAME SignalEngine.process()
+        #    as the dry-run so entry prices, signal timing, and forming-bar
+        #    behavior are identical.  No lookahead bias.
         self._status = "simulating"
-        self._progress = 40.0
+        self._progress = 25.0
         sim = Simulator(self.config)
 
-        # Pre-index for fast O(1) lookups
+        # One SignalEngine + rolling candle buffer per symbol (mirrors dry-run)
+        engines: dict[str, SignalEngine] = {}
+        buffers: dict[str, list[dict]] = {}
+        for sym in all_dfs:
+            engines[sym] = SignalEngine(self.config)
+            buffers[sym] = []
+
+        # Pre-index candles for O(1) lookup
         indexed: dict[str, dict[str, Any]] = {}
         for sym, df in all_dfs.items():
             times = df["open_time"].values
             indexed[sym] = {
+                "candles": df.to_dict("records"),
                 "highs": df["high"].values,
                 "lows": df["low"].values,
                 "close_times": df["close_time"].values,
@@ -102,10 +103,11 @@ class Backtester:
 
         raw_equity: list[dict] = []
         total = len(all_times)
+        _MIN_CANDLES = 200  # warmup — same as dry-run pair_manager
 
         for step, t in enumerate(all_times):
             if step % 200 == 0:
-                self._progress = 40 + (step / total) * 50
+                self._progress = 25 + (step / total) * 65
 
             for sym in all_dfs:
                 idx_map = indexed[sym]["time_to_idx"]
@@ -113,16 +115,29 @@ class Backtester:
                     continue
                 i = idx_map[t]
 
-                # TP/SL first, then signal — matches dry-run order
+                # Add candle to rolling buffer (same as dry-run)
+                buffers[sym].append(indexed[sym]["candles"][i])
+                if len(buffers[sym]) > 1000:
+                    buffers[sym] = buffers[sym][-800:]
+
+                # Signal detection via dry-run's process() — forming bar included
+                signal: Signal | None = None
+                if len(buffers[sym]) >= _MIN_CANDLES:
+                    buf_df = pd.DataFrame(buffers[sym])
+                    buf_df["symbol"] = sym
+                    signal = engines[sym].process(buf_df)
+
+                # Signal FIRST, then TP/SL — matches TradingView switch priority
+                # and dry-run pair_manager order
+                if signal:
+                    sim.process_signal(signal, entry_time=int(t))
+
                 sim.process_candle(
                     sym,
                     float(indexed[sym]["highs"][i]),
                     float(indexed[sym]["lows"][i]),
                     int(indexed[sym]["close_times"][i]),
                 )
-
-                if t in signal_timelines[sym]:
-                    sim.process_signal(signal_timelines[sym][t], entry_time=int(t))
 
             raw_equity.append({"time": t, "equity": round(sim.wallet.balance, 2)})
 
@@ -226,7 +241,7 @@ class Backtester:
         atr_series = atr(high, low, close, 50)
 
         if use_alt and alt_mult > 1:
-            alt_df = engine._resample_ohlc(df, alt_mult)
+            alt_df = engine._resample_ohlc(df, alt_mult, drop_incomplete=False)
             if len(alt_df) < max(ma_period + 2, 10):
                 return signals
             close_ma = variant(ma_type, alt_df["close"], ma_period, alma_sigma, alma_offset)

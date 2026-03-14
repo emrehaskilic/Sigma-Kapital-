@@ -104,7 +104,7 @@ class Simulator:
                 # Same direction — no pyramiding
                 return closed_trades
             # Opposite direction — close existing position at current price (reversal)
-            closed_trades.extend(self._close_position(signal.symbol, signal.price))
+            closed_trades.extend(self._close_position(signal.symbol, signal.price, exit_time=entry_time or signal.timestamp))
 
         # Check if we have enough balance
         margin = self.wallet.margin_per_trade
@@ -117,16 +117,16 @@ class Simulator:
         self._positions[signal.symbol] = pos
         self._last_signal_ts[signal.symbol] = signal.timestamp
 
-        # Entry fee — market order = taker fee
+        # Entry fee — limit order = maker fee
         notional = margin * self.wallet.leverage
-        entry_fee = notional * self.wallet.taker_fee
+        entry_fee = notional * self.wallet.maker_fee
         self.wallet.balance -= entry_fee
         self.wallet.total_fees += entry_fee
-        self.wallet.taker_fees += entry_fee
+        self.wallet.maker_fees += entry_fee
 
         return closed_trades
 
-    def _close_position(self, symbol: str, exit_price: float) -> list[Trade]:
+    def _close_position(self, symbol: str, exit_price: float, exit_time: int = 0) -> list[Trade]:
         """Force-close a position at the given price (used for reversals)."""
         if not self.has_position(symbol):
             return []
@@ -144,13 +144,13 @@ class Simulator:
             pnl_pct = (pos.entry_price - exit_price) / pos.entry_price * 100
 
         pnl_usdt = trade_notional * pnl_pct / 100
-        # Reversal close = market order = taker fee
-        exit_fee = trade_notional * self.wallet.taker_fee
+        # Reversal close = limit order = maker fee
+        exit_fee = trade_notional * self.wallet.maker_fee
 
         self.wallet.balance += pnl_usdt - exit_fee
         self.wallet.total_pnl += pnl_usdt
         self.wallet.total_fees += exit_fee
-        self.wallet.taker_fees += exit_fee
+        self.wallet.maker_fees += exit_fee
         self.wallet.total_trades += 1
         if pnl_usdt > 0:
             self.wallet.winning_trades += 1
@@ -164,7 +164,7 @@ class Simulator:
             entry_price=pos.entry_price,
             entry_time=pos.entry_time,
             exit_price=exit_price,
-            exit_time=int(time.time() * 1000),
+            exit_time=exit_time or int(time.time() * 1000),
             exit_reason="REVERSAL",
             qty_usdt=trade_notional,
             leverage=self.wallet.leverage,
