@@ -21,7 +21,7 @@ import numpy as np
 import pandas as pd
 
 from core.engine.simulator import Simulator, Trade
-from core.strategy.indicators import atr, rsi, variant
+from core.strategy.indicators import atr, pmax, rsi, variant
 from core.strategy.signals import Signal, SignalEngine
 
 logger = logging.getLogger(__name__)
@@ -44,7 +44,9 @@ class Backtester:
 
     def __init__(self, config: dict) -> None:
         self.config = config
-        self._tf = config["strategy"]["timeframe"]
+        # Primary timeframe (for legacy compat)
+        tf_configs = config["strategy"].get("timeframes", [])
+        self._tf = tf_configs[0]["timeframe"] if tf_configs else config["strategy"].get("timeframe", "1m")
         self._progress = 0.0
         self._status = "idle"
 
@@ -57,39 +59,64 @@ class Backtester:
         end_ms = int(time.time() * 1000)
         start_ms = end_ms - lookback_days * 86400 * 1000
 
-        # 1. Fetch historical data
+        # Parse TF configs
+        tf_configs = self.config["strategy"].get("timeframes", [])
+        if not tf_configs:
+            tf_configs = [{
+                "label": self._tf,
+                "timeframe": self._tf,
+                "size_multiplier": 1,
+                "pmax": self.config["strategy"].get("pmax", {}),
+                "filters": self.config["strategy"].get("filters", {}),
+                "risk": self.config.get("risk", {}),
+            }]
+
+        # 1. Fetch historical data for each TF
+        # Key: "SYM:tf_label" → DataFrame
         all_dfs: dict[str, pd.DataFrame] = {}
-        for i, sym in enumerate(symbols):
-            self._progress = (i / len(symbols)) * 25
-            klines = self._fetch_historical(sym, self._tf, start_ms, end_ms)
-            if len(klines) >= 50:
-                df = pd.DataFrame(klines)
-                df["symbol"] = sym
-                all_dfs[sym] = df
-            logger.info("Backtest: fetched %s — %d candles", sym, len(klines))
+        total_fetches = len(symbols) * len(tf_configs)
+        fetch_i = 0
+        for sym in symbols:
+            for tf_cfg in tf_configs:
+                tf_label = tf_cfg.get("label", "1m")
+                interval = tf_cfg.get("timeframe", "1m")
+                fetch_i += 1
+                self._progress = (fetch_i / total_fetches) * 25
+
+                klines = self._fetch_historical(sym, interval, start_ms, end_ms)
+                if len(klines) >= 50:
+                    df = pd.DataFrame(klines)
+                    df["symbol"] = sym
+                    key = f"{sym}:{tf_label}"
+                    all_dfs[key] = df
+                logger.info("Backtest: fetched %s [%s] — %d candles", sym, tf_label, len(klines))
 
         if not all_dfs:
             return BacktestResult([], [], [], self._empty_metrics(), [])
 
-        # 2. Candle-by-candle simulation — uses the SAME SignalEngine.process()
-        #    as the dry-run so entry prices, signal timing, and forming-bar
-        #    behavior are identical.  No lookahead bias.
+        # 2. Candle-by-candle simulation — dual TF
         self._status = "simulating"
         self._progress = 25.0
         sim = Simulator(self.config)
 
-        # One SignalEngine + rolling candle buffer per symbol (mirrors dry-run)
+        # One SignalEngine + buffer per (symbol, tf)
         engines: dict[str, SignalEngine] = {}
         buffers: dict[str, list[dict]] = {}
-        for sym in all_dfs:
-            engines[sym] = SignalEngine(self.config)
-            buffers[sym] = []
+        tf_cfg_map: dict[str, dict] = {}
+        for tf_cfg in tf_configs:
+            tf_label = tf_cfg.get("label", "1m")
+            for sym in symbols:
+                key = f"{sym}:{tf_label}"
+                if key in all_dfs:
+                    engines[key] = SignalEngine(self.config, tf_config=tf_cfg)
+                    buffers[key] = []
+                    tf_cfg_map[key] = tf_cfg
 
-        # Pre-index candles for O(1) lookup
+        # Pre-index candles
         indexed: dict[str, dict[str, Any]] = {}
-        for sym, df in all_dfs.items():
+        for key, df in all_dfs.items():
             times = df["open_time"].values
-            indexed[sym] = {
+            indexed[key] = {
                 "candles": df.to_dict("records"),
                 "highs": df["high"].values,
                 "lows": df["low"].values,
@@ -97,47 +124,45 @@ class Backtester:
                 "time_to_idx": {int(t): i for i, t in enumerate(times)},
             }
 
+        # Collect all unique timestamps across all TFs
         all_times = sorted(set(
             int(t) for df in all_dfs.values() for t in df["open_time"].values
         ))
 
         raw_equity: list[dict] = []
         total = len(all_times)
-        _MIN_CANDLES = 200  # warmup — same as dry-run pair_manager
+        _MIN_CANDLES = 200
 
         for step, t in enumerate(all_times):
             if step % 200 == 0:
                 self._progress = 25 + (step / total) * 65
 
-            for sym in all_dfs:
-                idx_map = indexed[sym]["time_to_idx"]
+            for key in all_dfs:
+                idx_map = indexed[key]["time_to_idx"]
                 if t not in idx_map:
                     continue
                 i = idx_map[t]
 
-                # Add candle to rolling buffer (same as dry-run)
-                buffers[sym].append(indexed[sym]["candles"][i])
-                if len(buffers[sym]) > 1000:
-                    buffers[sym] = buffers[sym][-800:]
+                sym = key.rsplit(":", 1)[0]
+                tf_label = key.rsplit(":", 1)[1] if ":" in key else ""
 
-                # Signal detection via dry-run's process() — forming bar included
-                signal: Signal | None = None
-                if len(buffers[sym]) >= _MIN_CANDLES:
-                    buf_df = pd.DataFrame(buffers[sym])
-                    buf_df["symbol"] = sym
-                    signal = engines[sym].process(buf_df)
+                buffers[key].append(indexed[key]["candles"][i])
+                if len(buffers[key]) > 1000:
+                    buffers[key] = buffers[key][-800:]
 
-                # Signal FIRST, then TP/SL — matches TradingView switch priority
-                # and dry-run pair_manager order
+                if len(buffers[key]) < _MIN_CANDLES:
+                    continue
+
+                buf_df = pd.DataFrame(buffers[key])
+                buf_df["symbol"] = sym
+
+                # Signal detection (PMax crossover)
+                signal = engines[key].process(buf_df)
                 if signal:
                     sim.process_signal(signal, entry_time=int(t))
 
-                sim.process_candle(
-                    sym,
-                    float(indexed[sym]["highs"][i]),
-                    float(indexed[sym]["lows"][i]),
-                    int(indexed[sym]["close_times"][i]),
-                )
+                # Keltner DCA/TP check using full buffer DataFrame
+                sim.process_candle_with_df(sym, buf_df, tf_label=tf_label)
 
             raw_equity.append({"time": t, "equity": round(sim.wallet.balance, 2)})
 
@@ -211,100 +236,86 @@ class Backtester:
     # ── Signal Timeline ─────────────────────────────────────────────────
 
     def _compute_signal_timeline(self, df: pd.DataFrame) -> dict[int, Signal]:
-        """Walk alt-TF bars and record ALL crossover signals chronologically.
+        """Walk PMax crossover history and record ALL signals chronologically.
 
-        Uses the exact same crossover + condition logic as the dry-run
-        SignalEngine.process_backfill().
+        Uses PMax (Profit Maximizer) crossover logic:
+          MAvg crosses above PMax → LONG
+          MAvg crosses below PMax → SHORT
         """
         signals: dict[int, Signal] = {}
-        engine = SignalEngine(self.config)
 
         cfg = self.config["strategy"]
-        use_alt = cfg.get("use_alternate_signals", True)
-        alt_mult = cfg.get("alternate_multiplier", 8)
-        ma_type = cfg["ma_type"]
-        ma_period = cfg["ma_period"]
-        alma_sigma = cfg["alma_sigma"]
-        alma_offset = cfg["alma_offset"]
+        pmax_cfg = cfg.get("pmax", {})
         trade_type = self.config["trading"]["trade_type"]
 
         close = df["close"]
-        open_ = df["open"]
         high = df["high"]
         low = df["low"]
         symbol = str(df["symbol"].iloc[0])
 
-        base_times = df["open_time"].values
-        base_closes = df["close"].values
+        # Source for PMax
+        src_type = pmax_cfg.get("source", "hl2").lower()
+        if src_type == "hl2":
+            src = (high + low) / 2
+        elif src_type == "hlc3":
+            src = (high + low + close) / 3
+        elif src_type == "ohlc4":
+            src = (df["open"] + high + low + close) / 4
+        else:
+            src = close
+
+        times = df["open_time"].values
+        closes = df["close"].values
 
         rsi_series = rsi(close, 28)
         atr_series = atr(high, low, close, 50)
 
-        if use_alt and alt_mult > 1:
-            alt_df = engine._resample_ohlc(df, alt_mult, drop_incomplete=False)
-            if len(alt_df) < max(ma_period + 2, 10):
-                return signals
-            close_ma = variant(ma_type, alt_df["close"], ma_period, alma_sigma, alma_offset)
-            open_ma = variant(ma_type, alt_df["open"], ma_period, alma_sigma, alma_offset)
-            bar_times = alt_df["open_time"].values
-        else:
-            close_ma = variant(ma_type, close, ma_period, alma_sigma, alma_offset)
-            open_ma = variant(ma_type, open_, ma_period, alma_sigma, alma_offset)
-            bar_times = df["open_time"].values
+        pmax_line, mavg, direction = pmax(
+            src, high, low, close,
+            atr_period=pmax_cfg.get("atr_period", 10),
+            atr_multiplier=pmax_cfg.get("atr_multiplier", 3.0),
+            ma_type=pmax_cfg.get("ma_type", "EMA"),
+            ma_length=pmax_cfg.get("ma_length", 10),
+            change_atr=pmax_cfg.get("change_atr", True),
+            normalize_atr=pmax_cfg.get("normalize_atr", False),
+        )
 
-        close_ma_vals = close_ma.values
-        open_ma_vals = open_ma.values
-
-        def _base_close_at(alt_open_time: int) -> float:
-            idx = np.searchsorted(base_times, alt_open_time)
-            if idx < len(base_closes):
-                return float(base_closes[idx])
-            return float(base_closes[-1])
-
-        def _indicator_at(series: pd.Series, alt_open_time: int) -> float:
-            idx = np.searchsorted(base_times, alt_open_time)
-            idx = min(idx, len(series) - 1)
-            return float(series.iloc[idx])
-
-        # Walk all bars — Pine Script condition state machine.
-        # condition tracks MA crossover state independently of trade_type filter.
-        # This matches dry-run process() behavior exactly.
+        pmax_vals = pmax_line.values
+        mavg_vals = mavg.values
         condition = 0.0
 
-        for i in range(1, len(close_ma_vals)):
-            prev_c = close_ma_vals[i - 1]
-            prev_o = open_ma_vals[i - 1]
-            curr_c = close_ma_vals[i]
-            curr_o = open_ma_vals[i]
+        for i in range(1, len(mavg_vals)):
+            prev_m = mavg_vals[i - 1]
+            prev_p = pmax_vals[i - 1]
+            curr_m = mavg_vals[i]
+            curr_p = pmax_vals[i]
 
-            if np.isnan(prev_c) or np.isnan(prev_o) or np.isnan(curr_c) or np.isnan(curr_o):
+            if np.isnan(prev_m) or np.isnan(prev_p) or np.isnan(curr_m) or np.isnan(curr_p):
                 continue
 
-            le_trigger = prev_c <= prev_o and curr_c > curr_o
-            se_trigger = prev_c >= prev_o and curr_c < curr_o
+            buy_cross = prev_m <= prev_p and curr_m > curr_p
+            sell_cross = prev_m >= prev_p and curr_m < curr_p
 
-            t = int(bar_times[i])
-            entry_price = _base_close_at(t)
+            t = int(times[i])
+            entry_price = float(closes[i])
 
-            # Condition updates FIRST (regardless of trade_type), then signal
-            # is emitted only if trade_type matches — same as Pine Script
-            if le_trigger and condition <= 0.0:
+            if buy_cross and condition <= 0.0:
                 condition = 1.0
                 if trade_type in ("LONG", "BOTH"):
                     signals[t] = Signal(
                         timestamp=t, symbol=symbol, side="LONG",
                         price=entry_price,
-                        rsi_value=_indicator_at(rsi_series, t),
-                        atr_value=_indicator_at(atr_series, t),
+                        rsi_value=float(rsi_series.iloc[i]) if i < len(rsi_series) else 0,
+                        atr_value=float(atr_series.iloc[i]) if i < len(atr_series) else 0,
                     )
-            elif se_trigger and condition >= 0.0:
+            elif sell_cross and condition >= 0.0:
                 condition = -1.0
                 if trade_type in ("SHORT", "BOTH"):
                     signals[t] = Signal(
                         timestamp=t, symbol=symbol, side="SHORT",
                         price=entry_price,
-                        rsi_value=_indicator_at(rsi_series, t),
-                        atr_value=_indicator_at(atr_series, t),
+                        rsi_value=float(rsi_series.iloc[i]) if i < len(rsi_series) else 0,
+                        atr_value=float(atr_series.iloc[i]) if i < len(atr_series) else 0,
                     )
 
         return signals
@@ -446,6 +457,7 @@ class Backtester:
             "leverage": t.leverage,
             "entry_time": t.entry_time,
             "exit_time": t.exit_time,
+            "tf_label": t.tf_label,
         }
 
     @staticmethod

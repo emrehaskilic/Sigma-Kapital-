@@ -61,6 +61,84 @@ def alma(series: pd.Series, period: int, offset: float = 0.85, sigma: int = 5) -
     return series.rolling(window=period, min_periods=period).apply(_alma_calc, raw=True)
 
 
+def wma(series: pd.Series, period: int) -> pd.Series:
+    """Weighted Moving Average."""
+    return series.rolling(window=period, min_periods=period).apply(
+        lambda x: np.average(x, weights=np.arange(1, len(x) + 1)), raw=True
+    )
+
+
+def tma(series: pd.Series, period: int) -> pd.Series:
+    """Triangular Moving Average."""
+    first = sma(series, math.ceil(period / 2))
+    return sma(first, math.floor(period / 2) + 1)
+
+
+def var_ma(series: pd.Series, period: int) -> pd.Series:
+    """Variable Moving Average (Chande's Variable Index Dynamic Average)."""
+    valpha = 2.0 / (period + 1)
+    result = np.empty(len(series))
+    result[:] = np.nan
+    src = series.values
+
+    for i in range(9, len(src)):
+        if np.isnan(src[i]):
+            continue
+        # CMO calculation over 9 bars
+        vud = 0.0
+        vdd = 0.0
+        for j in range(9):
+            idx = i - j
+            if idx < 1 or np.isnan(src[idx]) or np.isnan(src[idx - 1]):
+                continue
+            if src[idx] > src[idx - 1]:
+                vud += src[idx] - src[idx - 1]
+            else:
+                vdd += src[idx - 1] - src[idx]
+        vcmo = (vud - vdd) / (vud + vdd) if (vud + vdd) != 0 else 0.0
+
+        prev = result[i - 1] if not np.isnan(result[i - 1]) else src[i]
+        result[i] = valpha * abs(vcmo) * src[i] + (1 - valpha * abs(vcmo)) * prev
+
+    return pd.Series(result, index=series.index)
+
+
+def wwma(series: pd.Series, period: int) -> pd.Series:
+    """Welles Wilder Moving Average."""
+    alpha = 1.0 / period
+    result = np.empty(len(series))
+    result[:] = np.nan
+    src = series.values
+
+    for i in range(len(src)):
+        if np.isnan(src[i]):
+            continue
+        if np.isnan(result[i - 1]) if i > 0 else True:
+            result[i] = src[i]
+        else:
+            result[i] = alpha * src[i] + (1 - alpha) * result[i - 1]
+
+    return pd.Series(result, index=series.index)
+
+
+def zlema(series: pd.Series, period: int) -> pd.Series:
+    """Zero Lag EMA."""
+    lag = period // 2 if period % 2 == 0 else (period - 1) // 2
+    adjusted = series + (series - series.shift(lag))
+    return ema(adjusted, period)
+
+
+def tsf(series: pd.Series, period: int) -> pd.Series:
+    """Time Series Forecast (linear regression forecast)."""
+    lrc = series.rolling(window=period, min_periods=period).apply(
+        lambda x: np.polyval(np.polyfit(np.arange(len(x)), x, 1), len(x) - 1), raw=True
+    )
+    lrc1 = series.rolling(window=period, min_periods=period).apply(
+        lambda x: np.polyval(np.polyfit(np.arange(len(x)), x, 1), len(x)), raw=True
+    )
+    return lrc + (lrc - lrc1)
+
+
 def variant(
     ma_type: str,
     series: pd.Series,
@@ -78,8 +156,116 @@ def variant(
         return hull_ma(series, period)
     elif ma_type == "EMA":
         return ema(series, period)
+    elif ma_type == "WMA":
+        return wma(series, period)
+    elif ma_type == "TMA":
+        return tma(series, period)
+    elif ma_type == "VAR":
+        return var_ma(series, period)
+    elif ma_type == "WWMA":
+        return wwma(series, period)
+    elif ma_type == "ZLEMA":
+        return zlema(series, period)
+    elif ma_type == "TSF":
+        return tsf(series, period)
     else:
         return sma(series, period)
+
+
+# =====================================================================
+# PMax (Profit Maximizer)
+# =====================================================================
+
+def atr_sma(high: pd.Series, low: pd.Series, close: pd.Series, period: int) -> pd.Series:
+    """ATR using SMA method (Pine Script's sma(tr, period))."""
+    prev_close = close.shift(1)
+    tr = pd.concat(
+        [high - low, (high - prev_close).abs(), (low - prev_close).abs()],
+        axis=1,
+    ).max(axis=1)
+    return tr.rolling(window=period, min_periods=period).mean()
+
+
+def atr_rma(high: pd.Series, low: pd.Series, close: pd.Series, period: int) -> pd.Series:
+    """ATR using RMA/Wilder method (Pine Script's atr(period))."""
+    prev_close = close.shift(1)
+    tr = pd.concat(
+        [high - low, (high - prev_close).abs(), (low - prev_close).abs()],
+        axis=1,
+    ).max(axis=1)
+    return tr.ewm(alpha=1.0 / period, min_periods=period, adjust=False).mean()
+
+
+def pmax(
+    src: pd.Series,
+    high: pd.Series,
+    low: pd.Series,
+    close: pd.Series,
+    atr_period: int = 10,
+    atr_multiplier: float = 3.0,
+    ma_type: str = "EMA",
+    ma_length: int = 10,
+    change_atr: bool = True,
+    normalize_atr: bool = False,
+) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """Profit Maximizer (PMax) indicator.
+
+    Returns (pmax_line, mavg, direction) where:
+      - pmax_line: the PMax trailing stop line
+      - mavg: the moving average line
+      - direction: 1 = bullish, -1 = bearish
+    """
+    # Compute ATR
+    if change_atr:
+        atr_vals = atr_rma(high, low, close, atr_period)
+    else:
+        atr_vals = atr_sma(high, low, close, atr_period)
+
+    # Compute Moving Average on source
+    mavg = variant(ma_type, src, ma_length)
+
+    mavg_vals = mavg.values.copy()
+    atr_v = atr_vals.values.copy()
+    close_vals = close.values.copy()
+    n = len(mavg_vals)
+
+    long_stop = np.full(n, np.nan)
+    short_stop = np.full(n, np.nan)
+    direction = np.ones(n)
+    pmax_line = np.full(n, np.nan)
+
+    for i in range(1, n):
+        if np.isnan(mavg_vals[i]) or np.isnan(atr_v[i]):
+            continue
+
+        atr_component = atr_v[i] / close_vals[i] if normalize_atr else atr_v[i]
+
+        # Long stop (support)
+        ls = mavg_vals[i] - atr_multiplier * atr_component
+        prev_ls = long_stop[i - 1] if not np.isnan(long_stop[i - 1]) else ls
+        long_stop[i] = max(ls, prev_ls) if mavg_vals[i] > prev_ls else ls
+
+        # Short stop (resistance)
+        ss = mavg_vals[i] + atr_multiplier * atr_component
+        prev_ss = short_stop[i - 1] if not np.isnan(short_stop[i - 1]) else ss
+        short_stop[i] = min(ss, prev_ss) if mavg_vals[i] < prev_ss else ss
+
+        # Direction
+        prev_dir = direction[i - 1]
+        if prev_dir == -1 and mavg_vals[i] > short_stop[i - 1]:
+            direction[i] = 1
+        elif prev_dir == 1 and mavg_vals[i] < long_stop[i - 1]:
+            direction[i] = -1
+        else:
+            direction[i] = prev_dir
+
+        pmax_line[i] = long_stop[i] if direction[i] == 1 else short_stop[i]
+
+    return (
+        pd.Series(pmax_line, index=src.index),
+        mavg,
+        pd.Series(direction, index=src.index),
+    )
 
 
 # =====================================================================
@@ -108,12 +294,21 @@ def atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 50) -> 
 
 
 def keltner_channel(
-    close: pd.Series, period: int = 80, multiplier: float = 10.5
+    high: pd.Series, low: pd.Series, close: pd.Series,
+    kc_length: int = 20, kc_multiplier: float = 1.5, atr_period: int = 10,
 ) -> tuple[pd.Series, pd.Series, pd.Series]:
-    """Keltner Channel: returns (basis, upper, lower)."""
-    basis = sma(close, period)
-    span = atr(close, close, close, period)  # simplified — use actual H/L if available
-    return basis, basis + span * multiplier, basis - span * multiplier
+    """Keltner Channel with proper ATR.
+
+    Returns (middle, upper, lower):
+      middle = EMA(close, kc_length)
+      upper  = middle + kc_multiplier * ATR(atr_period)
+      lower  = middle - kc_multiplier * ATR(atr_period)
+    """
+    middle = ema(close, kc_length)
+    atr_val = atr_rma(high, low, close, atr_period)
+    upper = middle + kc_multiplier * atr_val
+    lower = middle - kc_multiplier * atr_val
+    return middle, upper, lower
 
 
 # =====================================================================

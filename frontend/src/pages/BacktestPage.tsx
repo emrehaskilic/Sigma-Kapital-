@@ -114,6 +114,18 @@ export default function BacktestPage() {
     if (!config) return;
     setConfig({ ...config, [section]: { ...(config as any)[section], [key]: value } });
   };
+  const handleTfChange = (tfIdx: number, path: string, key: string, value: number | string | boolean) => {
+    if (!config) return;
+    const tfs = [...config.strategy.timeframes];
+    const tf = { ...tfs[tfIdx] } as any;
+    if (path) {
+      tf[path] = { ...tf[path], [key]: value };
+    } else {
+      tf[key] = value;
+    }
+    tfs[tfIdx] = tf;
+    setConfig({ ...config, strategy: { ...config.strategy, timeframes: tfs } });
+  };
   const handleRun = async () => {
     if (selectedSymbols.length === 0 || !config) return;
     setRunning(true);
@@ -311,89 +323,60 @@ export default function BacktestPage() {
               </div>
             </div>
 
-            {/* Strategy */}
-            <div>
-              <h2 className="text-[10px] font-semibold text-slate-500 uppercase tracking-wider mb-2">Strateji</h2>
-              <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-3 text-xs">
-                <label className="space-y-1">
-                  <span className="text-slate-500 text-[10px] uppercase">Timeframe</span>
-                  <select value={config.strategy.timeframe}
-                    onChange={(e) => handleConfigChange("strategy", "timeframe", e.target.value)}
-                    className="w-full bg-[#0b1217] border border-slate-700/30 rounded-lg px-2 py-1 text-sm text-slate-200">
-                    {["1m", "3m", "5m", "15m", "30m", "1h", "4h"].map(t => <option key={t} value={t}>{t}</option>)}
-                  </select>
-                </label>
-                <label className="space-y-1">
-                  <span className="text-slate-500 text-[10px] uppercase">MA Type</span>
-                  <select value={config.strategy.ma_type}
-                    onChange={(e) => handleConfigChange("strategy", "ma_type", e.target.value)}
-                    className="w-full bg-[#0b1217] border border-slate-700/30 rounded-lg px-2 py-1 text-sm text-slate-200">
-                    {["ALMA", "TEMA", "HullMA"].map(t => <option key={t} value={t}>{t}</option>)}
-                  </select>
-                </label>
-                <label className="space-y-1">
-                  <span className="text-slate-500 text-[10px] uppercase">MA Period</span>
-                  <input type="number" step="1" min="1"
-                    value={config.strategy.ma_period}
-                    onChange={(e) => handleConfigChange("strategy", "ma_period", +e.target.value)}
-                    className="w-full bg-[#0b1217] border border-slate-700/30 rounded-lg px-2 py-1 text-sm font-mono text-slate-200" />
-                </label>
-                <label className="space-y-1 flex flex-col">
-                  <span className="text-slate-500 text-[10px] uppercase">Alternate Signals</span>
-                  <div className="flex items-center gap-2 h-[30px]">
-                    <input type="checkbox"
-                      checked={config.strategy.use_alternate_signals}
-                      onChange={(e) => handleConfigChange("strategy", "use_alternate_signals", e.target.checked)}
-                      className="w-4 h-4 accent-sky-500 bg-[#0b1217] border-slate-700/30 rounded" />
-                    <span className="text-slate-400 text-[11px]">{config.strategy.use_alternate_signals ? "ON" : "OFF"}</span>
-                    {config.strategy.use_alternate_signals && (
-                      <input type="number" step="1" min="1"
-                        value={config.strategy.alternate_multiplier}
-                        onChange={(e) => handleConfigChange("strategy", "alternate_multiplier", +e.target.value)}
-                        className="w-12 bg-[#0b1217] border border-slate-700/30 rounded px-1.5 py-0.5 text-xs font-mono text-slate-200" />
-                    )}
-                  </div>
-                </label>
-                <label className="space-y-1">
-                  <span className="text-slate-500 text-[10px] uppercase">ALMA Sigma</span>
-                  <input type="number" step="1" min="0"
-                    value={config.strategy.alma_sigma}
-                    onChange={(e) => handleConfigChange("strategy", "alma_sigma", +e.target.value)}
-                    className="w-full bg-[#0b1217] border border-slate-700/30 rounded-lg px-2 py-1 text-sm font-mono text-slate-200" />
-                </label>
-                <label className="space-y-1">
-                  <span className="text-slate-500 text-[10px] uppercase">ALMA Offset</span>
-                  <input type="number" step="0.01" min="0"
-                    value={config.strategy.alma_offset}
-                    onChange={(e) => handleConfigChange("strategy", "alma_offset", +e.target.value)}
-                    className="w-full bg-[#0b1217] border border-slate-700/30 rounded-lg px-2 py-1 text-sm font-mono text-slate-200" />
-                </label>
-              </div>
-            </div>
-
-            {/* Risk */}
-            <div>
-              <h2 className="text-[10px] font-semibold text-slate-500 uppercase tracking-wider mb-2">Risk Management</h2>
-              <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-3 text-xs">
-                {[
-                  { section: "risk", key: "tp1_level", label: "Level TP1 %", step: "0.1" },
-                  { section: "risk", key: "tp1_qty", label: "Qty TP1 %", step: "1" },
-                  { section: "risk", key: "tp2_level", label: "Level TP2 %", step: "0.1" },
-                  { section: "risk", key: "tp2_qty", label: "Qty TP2 %", step: "1" },
-                  { section: "risk", key: "tp3_level", label: "Level TP3 %", step: "0.1" },
-                  { section: "risk", key: "tp3_qty", label: "Qty TP3 %", step: "1" },
-                  { section: "risk", key: "stop_loss", label: "Stop Loss %", step: "0.1" },
-                ].map(({ section, key, label, step }) => (
-                  <label key={key} className="space-y-1">
-                    <span className="text-slate-500 text-[10px] uppercase">{label}</span>
-                    <input type="number" step={step}
-                      value={(config as any)[section][key]}
-                      onChange={(e) => handleConfigChange(section, key, +e.target.value)}
+            {/* PMax Dual Timeframe Strategy + Risk */}
+            {config.strategy.timeframes.map((tf, idx) => (
+              <div key={tf.label}>
+                <h2 className="text-[10px] font-semibold text-slate-500 uppercase tracking-wider mb-2">
+                  PMax — {tf.label} <span className="text-sky-400/60">x{tf.size_multiplier} size</span>
+                </h2>
+                <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-3 text-xs mb-2">
+                  <label className="space-y-1">
+                    <span className="text-slate-500 text-[10px] uppercase">MA Type</span>
+                    <select value={tf.pmax.ma_type}
+                      onChange={(e) => handleTfChange(idx, "pmax", "ma_type", e.target.value)}
+                      className="w-full bg-[#0b1217] border border-slate-700/30 rounded-lg px-2 py-1 text-sm text-slate-200">
+                      {["SMA","EMA","WMA","TMA","VAR","WWMA","ZLEMA","TSF"].map(t => <option key={t} value={t}>{t}</option>)}
+                    </select>
+                  </label>
+                  <label className="space-y-1">
+                    <span className="text-slate-500 text-[10px] uppercase">MA Length</span>
+                    <input type="number" step="1" min="1"
+                      value={tf.pmax.ma_length}
+                      onChange={(e) => handleTfChange(idx, "pmax", "ma_length", +e.target.value)}
                       className="w-full bg-[#0b1217] border border-slate-700/30 rounded-lg px-2 py-1 text-sm font-mono text-slate-200" />
                   </label>
-                ))}
+                  <label className="space-y-1">
+                    <span className="text-slate-500 text-[10px] uppercase">ATR Period</span>
+                    <input type="number" step="1" min="1"
+                      value={tf.pmax.atr_period}
+                      onChange={(e) => handleTfChange(idx, "pmax", "atr_period", +e.target.value)}
+                      className="w-full bg-[#0b1217] border border-slate-700/30 rounded-lg px-2 py-1 text-sm font-mono text-slate-200" />
+                  </label>
+                  <label className="space-y-1">
+                    <span className="text-slate-500 text-[10px] uppercase">ATR Multiplier</span>
+                    <input type="number" step="0.1" min="0.1"
+                      value={tf.pmax.atr_multiplier}
+                      onChange={(e) => handleTfChange(idx, "pmax", "atr_multiplier", +e.target.value)}
+                      className="w-full bg-[#0b1217] border border-slate-700/30 rounded-lg px-2 py-1 text-sm font-mono text-slate-200" />
+                  </label>
+                  <label className="space-y-1">
+                    <span className="text-slate-500 text-[10px] uppercase">Source</span>
+                    <select value={tf.pmax.source}
+                      onChange={(e) => handleTfChange(idx, "pmax", "source", e.target.value)}
+                      className="w-full bg-[#0b1217] border border-slate-700/30 rounded-lg px-2 py-1 text-sm text-slate-200">
+                      {["hl2","close","hlc3","ohlc4"].map(t => <option key={t} value={t}>{t}</option>)}
+                    </select>
+                  </label>
+                  <label className="space-y-1">
+                    <span className="text-slate-500 text-[10px] uppercase">Size Mult</span>
+                    <input type="number" step="1" min="1"
+                      value={tf.size_multiplier}
+                      onChange={(e) => handleTfChange(idx, "", "size_multiplier", +e.target.value)}
+                      className="w-full bg-[#0b1217] border border-slate-700/30 rounded-lg px-2 py-1 text-sm font-mono text-slate-200" />
+                  </label>
+                </div>
               </div>
-            </div>
+            ))}
           </div>
         )}
 

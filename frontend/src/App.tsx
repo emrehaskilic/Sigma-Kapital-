@@ -1,11 +1,12 @@
 import { useState, useEffect, useRef } from "react";
 import { fetchSymbols, fetchStatus, startBot, stopBot, fetchConfig, updateConfig } from "./api";
-import type { StatusResponse, Config } from "./types";
+import type { StatusResponse, Config, TimeframeConfig } from "./types";
 import { MetricTile } from "./components/MetricTile";
 import { Badge } from "./components/Badge";
 import { PositionTable } from "./components/PositionTable";
 import { PairGrid } from "./components/PairGrid";
 import { TradeTable } from "./components/TradeTable";
+import { PMaxChart } from "./components/PMaxChart";
 import { formatNum, pnlColor } from "./utils";
 
 export default function App() {
@@ -66,6 +67,22 @@ export default function App() {
     setConfig({
       ...config,
       [section]: { ...(config as any)[section], [key]: value },
+    });
+  };
+
+  const handleTfChange = (tfIdx: number, path: string, key: string, value: number | string | boolean) => {
+    if (!config) return;
+    const tfs = [...config.strategy.timeframes];
+    const tf = { ...tfs[tfIdx] } as any;
+    if (path) {
+      tf[path] = { ...tf[path], [key]: value };
+    } else {
+      tf[key] = value;
+    }
+    tfs[tfIdx] = tf;
+    setConfig({
+      ...config,
+      strategy: { ...config.strategy, timeframes: tfs },
     });
   };
 
@@ -145,151 +162,97 @@ export default function App() {
         {/* ── Config Panel ── */}
         {!botRunning && config && (
           <div className="bg-[#131d2a]/80 rounded-xl border border-slate-700/20 p-4 space-y-3">
-            {/* ── Top Row: Trading + Strategy side by side ── */}
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-              {/* Trading */}
-              <div className="bg-[#0b1217]/60 rounded-lg p-3">
-                <h2 className="text-[10px] font-semibold text-sky-400/70 uppercase tracking-wider mb-2">Trading</h2>
-                <div className="grid grid-cols-2 gap-2 text-xs">
-                  {[
-                    { section: "trading", key: "initial_balance", label: "Ana Kasa (USDT)", step: "10" },
-                    { section: "trading", key: "margin_per_trade", label: "Margin/Trade", step: "10" },
-                    { section: "trading", key: "leverage", label: "Kaldirac", step: "1" },
-                  ].map(({ section, key, label, step }) => (
-                    <label key={key} className="space-y-0.5">
-                      <span className="text-slate-500 text-[10px] uppercase">{label}</span>
-                      <input type="number" step={step}
-                        value={(config as any)[section][key]}
-                        onChange={(e) => handleConfigChange(section, key, +e.target.value)}
-                        className="w-full bg-[#0b1217] border border-slate-700/30 rounded-lg px-2 py-1 text-sm font-mono text-slate-200" />
-                    </label>
-                  ))}
-                  <label className="space-y-0.5">
-                    <span className="text-slate-500 text-[10px] uppercase">Islem Tipi</span>
-                    <select value={config.trading.trade_type}
-                      onChange={(e) => handleConfigChange("trading", "trade_type", e.target.value)}
-                      className="w-full bg-[#0b1217] border border-slate-700/30 rounded-lg px-2 py-1 text-sm text-slate-200">
-                      {["BOTH","LONG","SHORT"].map(t => <option key={t} value={t}>{t}</option>)}
-                    </select>
+            {/* ── Trading Settings ── */}
+            <div className="bg-[#0b1217]/60 rounded-lg p-3">
+              <h2 className="text-[10px] font-semibold text-sky-400/70 uppercase tracking-wider mb-2">Trading</h2>
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-xs">
+                {[
+                  { section: "trading", key: "initial_balance", label: "Ana Kasa (USDT)", step: "10" },
+                  { section: "trading", key: "margin_per_trade", label: "Base Margin/Trade", step: "10" },
+                  { section: "trading", key: "leverage", label: "Kaldirac", step: "1" },
+                ].map(({ section, key, label, step }) => (
+                  <label key={key} className="space-y-0.5">
+                    <span className="text-slate-500 text-[10px] uppercase">{label}</span>
+                    <input type="number" step={step}
+                      value={(config as any)[section][key]}
+                      onChange={(e) => handleConfigChange(section, key, +e.target.value)}
+                      className="w-full bg-[#0b1217] border border-slate-700/30 rounded-lg px-2 py-1 text-sm font-mono text-slate-200" />
                   </label>
-                </div>
+                ))}
+                <label className="space-y-0.5">
+                  <span className="text-slate-500 text-[10px] uppercase">Islem Tipi</span>
+                  <select value={config.trading.trade_type}
+                    onChange={(e) => handleConfigChange("trading", "trade_type", e.target.value)}
+                    className="w-full bg-[#0b1217] border border-slate-700/30 rounded-lg px-2 py-1 text-sm text-slate-200">
+                    {["BOTH","LONG","SHORT"].map(t => <option key={t} value={t}>{t}</option>)}
+                  </select>
+                </label>
               </div>
+            </div>
 
-              {/* Strategy */}
-              <div className="bg-[#0b1217]/60 rounded-lg p-3">
-                <h2 className="text-[10px] font-semibold text-sky-400/70 uppercase tracking-wider mb-2">Strateji</h2>
-                <div className="grid grid-cols-3 gap-2 text-xs">
-                  <label className="space-y-0.5">
-                    <span className="text-slate-500 text-[10px] uppercase">Timeframe</span>
-                    <select value={config.strategy.timeframe}
-                      onChange={(e) => handleConfigChange("strategy", "timeframe", e.target.value)}
-                      className="w-full bg-[#0b1217] border border-slate-700/30 rounded-lg px-2 py-1 text-sm text-slate-200">
-                      {["1m","3m","5m","15m","30m","1h","4h"].map(t => <option key={t} value={t}>{t}</option>)}
-                    </select>
-                  </label>
+            {/* ── Dual Timeframe PMax Configs ── */}
+            {config.strategy.timeframes.map((tf, idx) => (
+              <div key={tf.label} className="bg-[#0b1217]/60 rounded-lg p-3 space-y-2">
+                <div className="flex items-center gap-2 mb-1">
+                  <h2 className="text-[10px] font-semibold text-sky-400/70 uppercase tracking-wider">
+                    PMax — {tf.label}
+                  </h2>
+                  <span className="text-[9px] px-1.5 py-0.5 rounded bg-sky-500/10 text-sky-400 font-mono">
+                    x{tf.size_multiplier} size
+                  </span>
+                </div>
+
+                {/* PMax Parameters */}
+                <div className="grid grid-cols-3 md:grid-cols-6 gap-2 text-xs">
                   <label className="space-y-0.5">
                     <span className="text-slate-500 text-[10px] uppercase">MA Type</span>
-                    <select value={config.strategy.ma_type}
-                      onChange={(e) => handleConfigChange("strategy", "ma_type", e.target.value)}
+                    <select value={tf.pmax.ma_type}
+                      onChange={(e) => handleTfChange(idx, "pmax", "ma_type", e.target.value)}
                       className="w-full bg-[#0b1217] border border-slate-700/30 rounded-lg px-2 py-1 text-sm text-slate-200">
-                      {["ALMA","TEMA","HullMA"].map(t => <option key={t} value={t}>{t}</option>)}
+                      {["SMA","EMA","WMA","TMA","VAR","WWMA","ZLEMA","TSF"].map(t => <option key={t} value={t}>{t}</option>)}
                     </select>
                   </label>
                   <label className="space-y-0.5">
-                    <span className="text-slate-500 text-[10px] uppercase">MA Period</span>
+                    <span className="text-slate-500 text-[10px] uppercase">MA Length</span>
                     <input type="number" step="1" min="1"
-                      value={config.strategy.ma_period}
-                      onChange={(e) => handleConfigChange("strategy", "ma_period", +e.target.value)}
+                      value={tf.pmax.ma_length}
+                      onChange={(e) => handleTfChange(idx, "pmax", "ma_length", +e.target.value)}
                       className="w-full bg-[#0b1217] border border-slate-700/30 rounded-lg px-2 py-1 text-sm font-mono text-slate-200" />
                   </label>
                   <label className="space-y-0.5">
-                    <span className="text-slate-500 text-[10px] uppercase">ALMA Sigma</span>
-                    <input type="number" step="1" min="0"
-                      value={config.strategy.alma_sigma}
-                      onChange={(e) => handleConfigChange("strategy", "alma_sigma", +e.target.value)}
+                    <span className="text-slate-500 text-[10px] uppercase">ATR Period</span>
+                    <input type="number" step="1" min="1"
+                      value={tf.pmax.atr_period}
+                      onChange={(e) => handleTfChange(idx, "pmax", "atr_period", +e.target.value)}
                       className="w-full bg-[#0b1217] border border-slate-700/30 rounded-lg px-2 py-1 text-sm font-mono text-slate-200" />
                   </label>
                   <label className="space-y-0.5">
-                    <span className="text-slate-500 text-[10px] uppercase">ALMA Offset</span>
-                    <input type="number" step="0.01" min="0"
-                      value={config.strategy.alma_offset}
-                      onChange={(e) => handleConfigChange("strategy", "alma_offset", +e.target.value)}
+                    <span className="text-slate-500 text-[10px] uppercase">ATR Multiplier</span>
+                    <input type="number" step="0.1" min="0.1"
+                      value={tf.pmax.atr_multiplier}
+                      onChange={(e) => handleTfChange(idx, "pmax", "atr_multiplier", +e.target.value)}
                       className="w-full bg-[#0b1217] border border-slate-700/30 rounded-lg px-2 py-1 text-sm font-mono text-slate-200" />
                   </label>
-                  <label className="space-y-0.5 flex flex-col">
-                    <span className="text-slate-500 text-[10px] uppercase">Alternate Signals</span>
-                    <div className="flex items-center gap-2 h-[30px]">
-                      <input type="checkbox"
-                        checked={config.strategy.use_alternate_signals}
-                        onChange={(e) => handleConfigChange("strategy", "use_alternate_signals", e.target.checked)}
-                        className="w-4 h-4 accent-sky-500 bg-[#0b1217] border-slate-700/30 rounded" />
-                      <span className="text-slate-400 text-[11px]">{config.strategy.use_alternate_signals ? "ON" : "OFF"}</span>
-                      {config.strategy.use_alternate_signals && (
-                        <input type="number" step="1" min="1"
-                          value={config.strategy.alternate_multiplier}
-                          onChange={(e) => handleConfigChange("strategy", "alternate_multiplier", +e.target.value)}
-                          className="w-12 bg-[#0b1217] border border-slate-700/30 rounded px-1.5 py-0.5 text-xs font-mono text-slate-200" />
-                      )}
-                    </div>
+                  <label className="space-y-0.5">
+                    <span className="text-slate-500 text-[10px] uppercase">Source</span>
+                    <select value={tf.pmax.source}
+                      onChange={(e) => handleTfChange(idx, "pmax", "source", e.target.value)}
+                      className="w-full bg-[#0b1217] border border-slate-700/30 rounded-lg px-2 py-1 text-sm text-slate-200">
+                      {["hl2","close","hlc3","ohlc4"].map(t => <option key={t} value={t}>{t}</option>)}
+                    </select>
+                  </label>
+                  <label className="space-y-0.5">
+                    <span className="text-slate-500 text-[10px] uppercase">Size Mult</span>
+                    <input type="number" step="1" min="1"
+                      value={tf.size_multiplier}
+                      onChange={(e) => handleTfChange(idx, "", "size_multiplier", +e.target.value)}
+                      className="w-full bg-[#0b1217] border border-slate-700/30 rounded-lg px-2 py-1 text-sm font-mono text-slate-200" />
                   </label>
                 </div>
-              </div>
-            </div>
 
-            {/* ── Bottom Row: Settings + Risk side by side ── */}
-            <div className="grid grid-cols-1 lg:grid-cols-[1fr_2fr] gap-4">
-              {/* Settings */}
-              <div className="bg-[#0b1217]/60 rounded-lg p-3">
-                <h2 className="text-[10px] font-semibold text-sky-400/70 uppercase tracking-wider mb-2">Supply / Demand</h2>
-                <div className="grid grid-cols-3 gap-2 text-xs">
-                  <label className="space-y-0.5">
-                    <span className="text-slate-500 text-[10px] uppercase">Swing Length</span>
-                    <input type="number" step="1" min="1" max="50"
-                      value={config.strategy.swing_length}
-                      onChange={(e) => handleConfigChange("strategy", "swing_length", +e.target.value)}
-                      className="w-full bg-[#0b1217] border border-slate-700/30 rounded-lg px-2 py-1 text-sm font-mono text-slate-200" />
-                  </label>
-                  <label className="space-y-0.5">
-                    <span className="text-slate-500 text-[10px] uppercase">Box Width</span>
-                    <input type="number" step="0.5" min="1" max="10"
-                      value={config.strategy.supply_demand_box_width}
-                      onChange={(e) => handleConfigChange("strategy", "supply_demand_box_width", +e.target.value)}
-                      className="w-full bg-[#0b1217] border border-slate-700/30 rounded-lg px-2 py-1 text-sm font-mono text-slate-200" />
-                  </label>
-                  <label className="space-y-0.5">
-                    <span className="text-slate-500 text-[10px] uppercase">History</span>
-                    <input type="number" step="1" min="5" max="50"
-                      value={config.strategy.history_to_keep}
-                      onChange={(e) => handleConfigChange("strategy", "history_to_keep", +e.target.value)}
-                      className="w-full bg-[#0b1217] border border-slate-700/30 rounded-lg px-2 py-1 text-sm font-mono text-slate-200" />
-                  </label>
-                </div>
               </div>
+            ))}
 
-              {/* Risk Management */}
-              <div className="bg-[#0b1217]/60 rounded-lg p-3">
-                <h2 className="text-[10px] font-semibold text-sky-400/70 uppercase tracking-wider mb-2">Risk Management</h2>
-                <div className="grid grid-cols-4 md:grid-cols-7 gap-2 text-xs">
-                  {[
-                    { section: "risk", key: "tp1_level", label: "TP1 %", step: "0.1" },
-                    { section: "risk", key: "tp1_qty", label: "TP1 Qty %", step: "1" },
-                    { section: "risk", key: "tp2_level", label: "TP2 %", step: "0.1" },
-                    { section: "risk", key: "tp2_qty", label: "TP2 Qty %", step: "1" },
-                    { section: "risk", key: "tp3_level", label: "TP3 %", step: "0.1" },
-                    { section: "risk", key: "tp3_qty", label: "TP3 Qty %", step: "1" },
-                    { section: "risk", key: "stop_loss", label: "Stop Loss %", step: "0.1" },
-                  ].map(({ section, key, label, step }) => (
-                    <label key={key} className="space-y-0.5">
-                      <span className="text-slate-500 text-[10px] uppercase">{label}</span>
-                      <input type="number" step={step}
-                        value={(config as any)[section][key]}
-                        onChange={(e) => handleConfigChange(section, key, +e.target.value)}
-                        className="w-full bg-[#0b1217] border border-slate-700/30 rounded-lg px-2 py-1 text-sm font-mono text-slate-200" />
-                    </label>
-                  ))}
-                </div>
-              </div>
-            </div>
           </div>
         )}
 
@@ -336,6 +299,11 @@ export default function App() {
             <h2 className="text-sm font-semibold text-slate-300 mb-3">Pair Durumlari</h2>
             <PairGrid pairs={status.pair_summaries} />
           </div>
+        )}
+
+        {/* ── PMax Chart ── */}
+        {botRunning && activeSymbols.length > 0 && (
+          <PMaxChart key={activeSymbols[0]} symbol={activeSymbols[0]} botRunning={botRunning} />
         )}
 
         {/* ── Open Positions ── */}

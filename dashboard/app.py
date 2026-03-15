@@ -201,20 +201,27 @@ def run_initial_scan(symbols: list[str], config: dict) -> dict:
                 }
             else:
                 # Check current MA state (is close_ma above or below open_ma?)
-                from core.strategy.indicators import variant, rsi as calc_rsi, ema as calc_ema
-                close_ma = variant(
-                    config["strategy"]["ma_type"], df["close"],
-                    config["strategy"]["ma_period"],
-                    config["strategy"]["alma_sigma"],
-                    config["strategy"]["alma_offset"],
+                from core.strategy.indicators import pmax as calc_pmax, rsi as calc_rsi
+                pmax_cfg = config["strategy"].get("pmax", {})
+                src_type = pmax_cfg.get("source", "hl2").lower()
+                if src_type == "hl2":
+                    src = (df["high"] + df["low"]) / 2
+                elif src_type == "hlc3":
+                    src = (df["high"] + df["low"] + df["close"]) / 3
+                elif src_type == "ohlc4":
+                    src = (df["open"] + df["high"] + df["low"] + df["close"]) / 4
+                else:
+                    src = df["close"]
+                _, mavg, direction = calc_pmax(
+                    src, df["high"], df["low"], df["close"],
+                    atr_period=pmax_cfg.get("atr_period", 10),
+                    atr_multiplier=pmax_cfg.get("atr_multiplier", 3.0),
+                    ma_type=pmax_cfg.get("ma_type", "EMA"),
+                    ma_length=pmax_cfg.get("ma_length", 10),
+                    change_atr=pmax_cfg.get("change_atr", True),
+                    normalize_atr=pmax_cfg.get("normalize_atr", False),
                 )
-                open_ma = variant(
-                    config["strategy"]["ma_type"], df["open"],
-                    config["strategy"]["ma_period"],
-                    config["strategy"]["alma_sigma"],
-                    config["strategy"]["alma_offset"],
-                )
-                trend = "BULLISH" if close_ma.iloc[-1] > open_ma.iloc[-1] else "BEARISH"
+                trend = "BULLISH" if direction.iloc[-1] == 1 else "BEARISH"
                 rsi_val = calc_rsi(df["close"], 28).iloc[-1]
                 results[sym] = {
                     "status": "monitoring",
@@ -264,13 +271,22 @@ with st.sidebar:
     )
 
     st.divider()
-    st.subheader("📊 Strateji Ayarlari")
-    ma_type = st.selectbox("MA Tipi", ["ALMA", "TEMA", "HullMA"], index=0)
-    ma_period = st.number_input("MA Periyodu", min_value=1, max_value=200, value=2)
+    st.subheader("📊 PMax Strateji Ayarlari")
+    pmax_cfg = st.session_state.config["strategy"].get("pmax", {})
+    pmax_ma_type = st.selectbox(
+        "MA Tipi",
+        ["SMA", "EMA", "WMA", "TMA", "VAR", "WWMA", "ZLEMA", "TSF"],
+        index=["SMA", "EMA", "WMA", "TMA", "VAR", "WWMA", "ZLEMA", "TSF"].index(
+            pmax_cfg.get("ma_type", "EMA")
+        ),
+    )
+    pmax_ma_length = st.number_input("MA Uzunlugu", min_value=1, max_value=200, value=pmax_cfg.get("ma_length", 10))
+    pmax_atr_period = st.number_input("ATR Periyodu", min_value=1, max_value=200, value=pmax_cfg.get("atr_period", 10))
+    pmax_atr_mult = st.number_input("ATR Carpani", min_value=0.1, max_value=20.0, value=float(pmax_cfg.get("atr_multiplier", 3.0)), step=0.1)
     timeframe = st.selectbox(
         "Zaman Dilimi",
         ["1m", "3m", "5m", "15m", "30m", "1h", "4h"],
-        index=3,
+        index=0,
     )
 
     st.divider()
@@ -291,8 +307,12 @@ with st.sidebar:
     st.session_state.config["trading"]["margin_per_trade"] = margin_per_trade
     st.session_state.config["trading"]["leverage"] = leverage
     st.session_state.config["trading"]["trade_type"] = trade_type
-    st.session_state.config["strategy"]["ma_type"] = ma_type
-    st.session_state.config["strategy"]["ma_period"] = ma_period
+    if "pmax" not in st.session_state.config["strategy"]:
+        st.session_state.config["strategy"]["pmax"] = {}
+    st.session_state.config["strategy"]["pmax"]["ma_type"] = pmax_ma_type
+    st.session_state.config["strategy"]["pmax"]["ma_length"] = pmax_ma_length
+    st.session_state.config["strategy"]["pmax"]["atr_period"] = pmax_atr_period
+    st.session_state.config["strategy"]["pmax"]["atr_multiplier"] = pmax_atr_mult
     st.session_state.config["strategy"]["timeframe"] = timeframe
     st.session_state.config["risk"]["tp1_level"] = tp1_level
     st.session_state.config["risk"]["tp1_qty"] = tp1_qty

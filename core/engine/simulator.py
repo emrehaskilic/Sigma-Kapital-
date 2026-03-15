@@ -1,18 +1,30 @@
-"""Dry-run simulation engine — virtual wallet + order execution."""
+"""Dry-run simulation — Keltner Channel DCA + TP.
+
+PMax = macro trend. Keltner Channels = micro DCA/TP levels.
+  LONG:  Limit BUY @ KC Lower (DCA)  |  Limit SELL @ KC Upper (TP)
+  SHORT: Limit SELL @ KC Upper (DCA) |  Limit BUY @ KC Lower (TP)
+All DCA/TP = maker fee. Entry + kill switch = taker fee.
+"""
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from core.strategy.risk_manager import ExitEvent, ExitReason, PositionState, RiskManager
+import numpy as np
+import pandas as pd
+
+from core.strategy.risk_manager import PositionState, RiskManager, MAX_DCA_STEPS
 from core.strategy.signals import Signal
+from core.strategy.indicators import keltner_channel
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
 class Trade:
-    """Completed trade record."""
     id: int
     symbol: str
     side: str
@@ -26,17 +38,17 @@ class Trade:
     pnl_usdt: float
     pnl_percent: float
     fee_usdt: float
+    tf_label: str = ""
 
 
 @dataclass
 class Wallet:
-    """Virtual wallet state."""
     initial_balance: float
     balance: float
     leverage: int
     margin_per_trade: float
-    maker_fee: float          # limit orders (TP/SL exits)
-    taker_fee: float          # market orders (entry/reversal)
+    maker_fee: float
+    taker_fee: float
     total_trades: int = 0
     winning_trades: int = 0
     losing_trades: int = 0
@@ -47,15 +59,22 @@ class Wallet:
 
 
 class Simulator:
-    """Paper trading simulator — processes signals and manages positions."""
+    """Keltner Channel DCA + TP dry-run simulator."""
 
     def __init__(self, config: dict) -> None:
         trading = config["trading"]
         self._risk_mgr = RiskManager(config)
+        self._config = config
 
-        # Support both old single fee_rate and new maker/taker split
-        maker = trading.get("maker_fee", trading.get("fee_rate", 0.0002))
-        taker = trading.get("taker_fee", trading.get("fee_rate", 0.0005))
+        # Keltner settings
+        tf_configs = config["strategy"].get("timeframes", [])
+        kc_cfg = tf_configs[0].get("keltner", {}) if tf_configs else {}
+        self._kc_length = kc_cfg.get("length", 20)
+        self._kc_multiplier = kc_cfg.get("multiplier", 1.5)
+        self._kc_atr_period = kc_cfg.get("atr_period", 10)
+
+        maker = trading.get("maker_fee", 0.0002)
+        taker = trading.get("taker_fee", 0.0005)
 
         self.wallet = Wallet(
             initial_balance=trading["initial_balance"],
@@ -65,92 +84,101 @@ class Simulator:
             maker_fee=maker,
             taker_fee=taker,
         )
-        # Active positions: symbol → PositionState
         self._positions: dict[str, PositionState] = {}
-        # Track last processed signal timestamp per symbol to prevent
-        # reopening positions after TP/SL exit from the same signal
+        self._size_multipliers: dict[str, float] = {}
+        self._tf_labels: dict[str, str] = {}
         self._last_signal_ts: dict[str, int] = {}
-        # Trade history
         self.trades: list[Trade] = []
         self._trade_counter = 0
+
+    @staticmethod
+    def _pos_key(symbol: str, tf_label: str) -> str:
+        return f"{symbol}:{tf_label}" if tf_label else symbol
+
+    def _get_margin(self, size_multiplier: float) -> float:
+        return self.wallet.margin_per_trade * size_multiplier
 
     @property
     def positions(self) -> dict[str, PositionState]:
         return self._positions
 
-    def has_position(self, symbol: str) -> bool:
-        return symbol in self._positions and self._positions[symbol].condition != 0.0
+    def has_position(self, symbol: str, tf_label: str = "") -> bool:
+        key = self._pos_key(symbol, tf_label)
+        return key in self._positions and self._positions[key].condition != 0.0
+
+    def has_any_position(self, symbol: str) -> bool:
+        for key, pos in self._positions.items():
+            if key.startswith(symbol + ":") and pos.condition != 0.0:
+                return True
+        return False
 
     def process_signal(self, signal: Signal, entry_time: int = 0) -> list[Trade]:
-        """Handle a new entry signal.
-
-        Pine Script reversal logic:
-          leTrigger and condition[1] <= 0.0 → open LONG  (closes SHORT if any)
-          seTrigger and condition[1] >= 0.0 → open SHORT (closes LONG if any)
-        Same-direction signal while in position → skip (no pyramiding).
-        Duplicate signal (same timestamp) after TP/SL exit → skip (prevents
-        process_backfill from reopening a closed position).
-        """
+        """PMax crossover → kill switch + new entry (market order = taker)."""
         closed_trades: list[Trade] = []
+        tf_label = signal.tf_label or ""
+        key = self._pos_key(signal.symbol, tf_label)
+        size_mult = signal.size_multiplier if signal.size_multiplier > 0 else 1.0
 
-        # Prevent reopening from the same signal after TP/SL exit
-        last_ts = self._last_signal_ts.get(signal.symbol, 0)
-        if signal.timestamp == last_ts and not self.has_position(signal.symbol):
+        last_ts = self._last_signal_ts.get(key, 0)
+        if signal.timestamp == last_ts and not self.has_position(signal.symbol, tf_label):
             return closed_trades
 
-        if self.has_position(signal.symbol):
-            existing = self._positions[signal.symbol]
+        if self.has_position(signal.symbol, tf_label):
+            existing = self._positions[key]
             if existing.side == signal.side:
-                # Same direction — no pyramiding
                 return closed_trades
-            # Opposite direction — close existing position at current price (reversal)
-            closed_trades.extend(self._close_position(signal.symbol, signal.price, exit_time=entry_time or signal.timestamp))
+            # KILL SWITCH
+            closed_trades.extend(
+                self._close_position(key, signal.price, exit_time=entry_time or signal.timestamp)
+            )
 
-        # Check if we have enough balance
-        margin = self.wallet.margin_per_trade
+        margin = self._get_margin(size_mult)
         if self.wallet.balance < margin:
             return closed_trades
 
-        # Open position
-        pos = self._risk_mgr.open_position(signal.symbol, signal.side, signal.price)
+        pos = self._risk_mgr.open_position(
+            signal.symbol, signal.side, signal.price, signal.atr_value,
+            margin_per_trade=margin, leverage=self.wallet.leverage,
+        )
         pos.entry_time = entry_time or signal.timestamp
-        self._positions[signal.symbol] = pos
-        self._last_signal_ts[signal.symbol] = signal.timestamp
+        self._positions[key] = pos
+        self._size_multipliers[key] = size_mult
+        self._tf_labels[key] = tf_label
+        self._last_signal_ts[key] = signal.timestamp
 
-        # Entry fee — limit order = maker fee
+        # Entry fee (market = taker)
         notional = margin * self.wallet.leverage
-        entry_fee = notional * self.wallet.maker_fee
+        entry_fee = notional * self.wallet.taker_fee
         self.wallet.balance -= entry_fee
         self.wallet.total_fees += entry_fee
-        self.wallet.maker_fees += entry_fee
+        self.wallet.taker_fees += entry_fee
 
         return closed_trades
 
-    def _close_position(self, symbol: str, exit_price: float, exit_time: int = 0) -> list[Trade]:
-        """Force-close a position at the given price (used for reversals)."""
-        if not self.has_position(symbol):
+    def _close_position(self, key: str, exit_price: float, exit_time: int = 0) -> list[Trade]:
+        """KILL SWITCH — market close (taker fee)."""
+        if key not in self._positions or self._positions[key].condition == 0.0:
             return []
 
-        pos = self._positions[symbol]
+        pos = self._positions[key]
         self._trade_counter += 1
-
-        margin = self.wallet.margin_per_trade
-        notional = margin * self.wallet.leverage
-        trade_notional = notional * pos.remaining_qty
+        tf_label = self._tf_labels.get(key, "")
+        notional = pos.total_position_notional
+        if notional <= 0:
+            return []
 
         if pos.side == "LONG":
-            pnl_pct = (exit_price - pos.entry_price) / pos.entry_price * 100
+            pnl_pct = (exit_price - pos.average_entry_price) / pos.average_entry_price * 100
         else:
-            pnl_pct = (pos.entry_price - exit_price) / pos.entry_price * 100
+            pnl_pct = (pos.average_entry_price - exit_price) / pos.average_entry_price * 100
 
-        pnl_usdt = trade_notional * pnl_pct / 100
-        # Reversal close = limit order = maker fee
-        exit_fee = trade_notional * self.wallet.maker_fee
+        pnl_usdt = notional * pnl_pct / 100
+        exit_fee = notional * self.wallet.taker_fee
 
         self.wallet.balance += pnl_usdt - exit_fee
         self.wallet.total_pnl += pnl_usdt
         self.wallet.total_fees += exit_fee
-        self.wallet.maker_fees += exit_fee
+        self.wallet.taker_fees += exit_fee
         self.wallet.total_trades += 1
         if pnl_usdt > 0:
             self.wallet.winning_trades += 1
@@ -158,101 +186,137 @@ class Simulator:
             self.wallet.losing_trades += 1
 
         trade = Trade(
-            id=self._trade_counter,
-            symbol=symbol,
-            side=pos.side,
-            entry_price=pos.entry_price,
-            entry_time=pos.entry_time,
-            exit_price=exit_price,
-            exit_time=exit_time or int(time.time() * 1000),
-            exit_reason="REVERSAL",
-            qty_usdt=trade_notional,
-            leverage=self.wallet.leverage,
-            pnl_usdt=round(pnl_usdt, 4),
-            pnl_percent=round(pnl_pct, 4),
-            fee_usdt=round(exit_fee, 4),
+            id=self._trade_counter, symbol=pos.symbol, side=pos.side,
+            entry_price=pos.average_entry_price, entry_time=pos.entry_time,
+            exit_price=exit_price, exit_time=exit_time or int(time.time() * 1000),
+            exit_reason="REVERSAL", qty_usdt=round(notional, 2),
+            leverage=pos.leverage, pnl_usdt=round(pnl_usdt, 4),
+            pnl_percent=round(pnl_pct, 4), fee_usdt=round(exit_fee, 4),
+            tf_label=tf_label,
         )
         self.trades.append(trade)
-
-        # Mark closed
         pos.condition = 0.0
         pos.remaining_qty = 0.0
-
+        pos.total_position_notional = 0.0
         return [trade]
 
-    def process_candle(self, symbol: str, high: float, low: float, close_time: int) -> list[Trade]:
-        """Check TP/SL for an active position. Returns completed trades."""
-        if not self.has_position(symbol):
+    def process_candle_with_df(self, symbol: str, df: pd.DataFrame,
+                                tf_label: str = "") -> list[Trade]:
+        """Process one candle using full DataFrame for Keltner calculation.
+
+        Simulates limit orders at KC bands:
+        - DCA limit at KC Lower (LONG) / KC Upper (SHORT)
+        - TP limit at KC Upper (LONG) / KC Lower (SHORT)
+        - Fill = candle H/L touched the band
+        - Fee = maker (Post-Only / GTX)
+        """
+        key = self._pos_key(symbol, tf_label)
+        if key not in self._positions or self._positions[key].condition == 0.0:
             return []
 
-        pos = self._positions[symbol]
-        exits = self._risk_mgr.check_exits(pos, high, low)
+        pos = self._positions[key]
+        pos_tf = self._tf_labels.get(key, "")
+
+        if len(df) < max(self._kc_length, self._kc_atr_period) + 1:
+            return []
+
+        # Calculate Keltner Channel
+        kc_mid, kc_upper, kc_lower = keltner_channel(
+            df["high"], df["low"], df["close"],
+            kc_length=self._kc_length,
+            kc_multiplier=self._kc_multiplier,
+            atr_period=self._kc_atr_period,
+        )
+
+        upper_val = kc_upper.iloc[-1]
+        lower_val = kc_lower.iloc[-1]
+        if np.isnan(upper_val) or np.isnan(lower_val):
+            return []
+
+        candle_high = float(df["high"].iloc[-1])
+        candle_low = float(df["low"].iloc[-1])
+        candle_close = float(df["close"].iloc[-1])
+        close_time = int(df["open_time"].iloc[-1])
+
+        # Update pending order prices (for display)
+        if pos.side == "LONG":
+            pos.pending_dca_price = lower_val
+            pos.pending_tp_price = upper_val
+        else:
+            pos.pending_dca_price = upper_val
+            pos.pending_tp_price = lower_val
+
+        # Check Keltner signals
+        action, fill_price = self._risk_mgr.check_keltner_signals(
+            pos, candle_high, candle_low, candle_close, upper_val, lower_val,
+        )
+
         completed: list[Trade] = []
 
-        for exit_ev in exits:
-            trade = self._record_trade(pos, exit_ev, close_time)
-            completed.append(trade)
+        if action == "DCA":
+            self._risk_mgr.process_dca_fill(pos, fill_price)
+            step_notional = pos.margin_per_step * pos.leverage
+            dca_fee = step_notional * self.wallet.maker_fee  # limit = maker
+            self.wallet.balance -= dca_fee
+            self.wallet.total_fees += dca_fee
+            self.wallet.maker_fees += dca_fee
 
-        # Mark fully closed positions (don't delete — let caller handle cleanup)
-        if pos.remaining_qty <= 0 or abs(pos.condition) >= 1.3:
-            pos.condition = 0.0
-            pos.remaining_qty = 0.0
+            self._trade_counter += 1
+            trade = Trade(
+                id=self._trade_counter, symbol=pos.symbol, side=pos.side,
+                entry_price=fill_price, entry_time=close_time,
+                exit_price=fill_price, exit_time=close_time,
+                exit_reason="DCA", qty_usdt=round(step_notional, 2),
+                leverage=pos.leverage, pnl_usdt=0.0, pnl_percent=0.0,
+                fee_usdt=round(dca_fee, 4), tf_label=pos_tf,
+            )
+            completed.append(trade)
+            self.trades.append(trade)
+
+        elif action == "TP":
+            avg_before = pos.average_entry_price
+            closed_notional = self._risk_mgr.process_tp_fill(pos, fill_price)
+            if closed_notional > 0:
+                self._trade_counter += 1
+                if pos.side == "LONG":
+                    pnl_pct = (fill_price - avg_before) / avg_before * 100
+                else:
+                    pnl_pct = (avg_before - fill_price) / avg_before * 100
+                pnl_usdt = closed_notional * pnl_pct / 100
+                tp_fee = closed_notional * self.wallet.maker_fee  # limit = maker
+                self.wallet.balance += pnl_usdt - tp_fee
+                self.wallet.total_pnl += pnl_usdt
+                self.wallet.total_fees += tp_fee
+                self.wallet.maker_fees += tp_fee
+                self.wallet.total_trades += 1
+                if pnl_usdt > 0:
+                    self.wallet.winning_trades += 1
+                else:
+                    self.wallet.losing_trades += 1
+
+                trade = Trade(
+                    id=self._trade_counter, symbol=pos.symbol, side=pos.side,
+                    entry_price=avg_before, entry_time=pos.entry_time,
+                    exit_price=fill_price, exit_time=close_time,
+                    exit_reason="TP", qty_usdt=round(closed_notional, 2),
+                    leverage=pos.leverage, pnl_usdt=round(pnl_usdt, 4),
+                    pnl_percent=round(pnl_pct, 4), fee_usdt=round(tp_fee, 4),
+                    tf_label=pos_tf,
+                )
+                completed.append(trade)
+                self.trades.append(trade)
 
         return completed
 
-    def _record_trade(self, pos: PositionState, exit_ev: ExitEvent, close_time: int) -> Trade:
-        """Record a completed (partial) trade."""
-        self._trade_counter += 1
-
-        margin = self.wallet.margin_per_trade
-        notional = margin * self.wallet.leverage
-        trade_notional = notional * (exit_ev.qty_percent / 100)
-
-        # PnL calculation
-        if pos.side == "LONG":
-            pnl_pct = (exit_ev.price - pos.entry_price) / pos.entry_price * 100
-        else:
-            pnl_pct = (pos.entry_price - exit_ev.price) / pos.entry_price * 100
-
-        pnl_usdt = trade_notional * pnl_pct / 100
-        # TP/SL exits = limit order = maker fee
-        exit_fee = trade_notional * self.wallet.maker_fee
-
-        # Update wallet
-        self.wallet.balance += pnl_usdt - exit_fee
-        self.wallet.total_pnl += pnl_usdt
-        self.wallet.total_fees += exit_fee
-        self.wallet.maker_fees += exit_fee
-        self.wallet.total_trades += 1
-        if pnl_usdt > 0:
-            self.wallet.winning_trades += 1
-        else:
-            self.wallet.losing_trades += 1
-
-        trade = Trade(
-            id=self._trade_counter,
-            symbol=pos.symbol,
-            side=pos.side,
-            entry_price=pos.entry_price,
-            entry_time=pos.entry_time,
-            exit_price=exit_ev.price,
-            exit_time=close_time,
-            exit_reason=exit_ev.reason.value,
-            qty_usdt=trade_notional,
-            leverage=self.wallet.leverage,
-            pnl_usdt=round(pnl_usdt, 4),
-            pnl_percent=round(pnl_pct, 4),
-            fee_usdt=round(exit_fee, 4),
-        )
-        self.trades.append(trade)
-        return trade
+    def process_candle(self, symbol: str, high: float, low: float, close_time: int,
+                       tf_label: str = "", candle_close: float = 0.0) -> list[Trade]:
+        """Stub — use process_candle_with_df for Keltner (needs full DataFrame)."""
+        return []
 
     def get_stats(self) -> dict[str, Any]:
-        """Return summary statistics."""
         win_rate = (
             self.wallet.winning_trades / self.wallet.total_trades * 100
-            if self.wallet.total_trades > 0
-            else 0
+            if self.wallet.total_trades > 0 else 0
         )
         return {
             "initial_balance": self.wallet.initial_balance,
@@ -260,9 +324,7 @@ class Simulator:
             "total_pnl": round(self.wallet.total_pnl, 2),
             "total_pnl_pct": round(
                 (self.wallet.balance - self.wallet.initial_balance)
-                / self.wallet.initial_balance
-                * 100,
-                2,
+                / self.wallet.initial_balance * 100, 2,
             ),
             "total_trades": self.wallet.total_trades,
             "winning_trades": self.wallet.winning_trades,

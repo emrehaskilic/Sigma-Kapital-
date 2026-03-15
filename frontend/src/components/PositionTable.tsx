@@ -28,10 +28,6 @@ export function PositionTable({ positions }: Props) {
             <th className="text-right py-2 px-2">Mark</th>
             <th className="text-right py-2 px-2">Breakeven</th>
             <th className="text-right py-2 px-2">Notional</th>
-            <th className="text-right py-2 px-2">TP1</th>
-            <th className="text-right py-2 px-2">TP2</th>
-            <th className="text-right py-2 px-2">TP3</th>
-            <th className="text-right py-2 px-2">SL</th>
             <th className="text-right py-2 px-2">uPnL</th>
             <th className="text-right py-2 px-2">uPnL %</th>
             <th className="text-right py-2 px-2">rPnL</th>
@@ -64,10 +60,6 @@ export function PositionTable({ positions }: Props) {
               <td className="py-2 px-2 text-right font-mono text-slate-300">{formatNum(p.mark_price, 4)}</td>
               <td className="py-2 px-2 text-right font-mono text-amber-400">{formatNum(p.break_even, 4)}</td>
               <td className="py-2 px-2 text-right font-mono text-sky-400">{formatNum(p.notional_usdt, 2)}</td>
-              <td className="py-2 px-2 text-right font-mono text-slate-400">{formatNum(p.tp1, 4)}</td>
-              <td className="py-2 px-2 text-right font-mono text-slate-400">{formatNum(p.tp2, 4)}</td>
-              <td className="py-2 px-2 text-right font-mono text-slate-400">{formatNum(p.tp3, 4)}</td>
-              <td className="py-2 px-2 text-right font-mono text-red-400">{formatNum(p.sl, 4)}</td>
               <td className={`py-2 px-2 text-right font-mono font-semibold ${pnlColor(p.unrealized_pnl_usdt)}`}>
                 {formatNum(p.unrealized_pnl_usdt, 4, true)}
               </td>

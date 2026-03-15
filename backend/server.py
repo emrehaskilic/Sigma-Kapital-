@@ -118,138 +118,115 @@ _TIMEFRAME_SECONDS = {
 
 
 def _signal_scanner_loop() -> None:
-    """Background thread: re-check crossovers every candle close."""
+    """Background thread: re-check PMax crossovers for each TF on candle close."""
     logger.info("Signal scanner started")
-    last_scan_bucket = 0
+    last_scan_buckets: dict[str, int] = {}  # tf_label → last bucket
 
     while state["bot_running"]:
-        time.sleep(5)  # check every 5s if a new candle closed
+        time.sleep(5)
 
         if not state["bot_running"] or not state["active_symbols"]:
             continue
 
         cfg = state["config"]
-        tf = cfg["strategy"]["timeframe"]
-        interval_s = _TIMEFRAME_SECONDS.get(tf, 900)
-
-        # Only scan when a new candle bucket starts
-        now = int(time.time())
-        current_bucket = now // interval_s
-        if current_bucket == last_scan_bucket:
+        tf_configs = cfg["strategy"].get("timeframes", [])
+        if not tf_configs:
             continue
-        last_scan_bucket = current_bucket
-
-        # Wait a few seconds for candle to finalize on Binance
-        time.sleep(10)
-
-        logger.info("Signal scanner: new %s candle — rescanning %d symbols",
-                     tf, len(state["active_symbols"]))
 
         sim = state["simulator"]
         if not sim:
             continue
 
         rest: BinanceRest = state["rest"]
+        now = int(time.time())
 
-        for sym in list(state["active_symbols"]):
-            if not state["bot_running"]:
-                break
-            try:
-                klines = rest.fetch_klines_sync(sym, tf, limit=1500)
-                if len(klines) < 200:
-                    continue
+        for tf_cfg in tf_configs:
+            tf_label = tf_cfg.get("label", "1m")
+            interval = tf_cfg.get("timeframe", "1m")
+            interval_s = _TIMEFRAME_SECONDS.get(interval, 60)
 
-                # Last element from Binance is the current forming candle — drop it
-                # but use klines[-2] (just-closed candle) for TP/SL check
-                last_closed = klines[-2] if len(klines) >= 2 else klines[-1]
-                klines_for_signal = klines[:-1]
+            current_bucket = now // interval_s
+            if current_bucket == last_scan_buckets.get(tf_label, 0):
+                continue
+            last_scan_buckets[tf_label] = current_bucket
 
-                df = pd.DataFrame(klines_for_signal)
-                df["symbol"] = sym
+            time.sleep(5)  # wait for candle to finalize
 
-                # Detect NEW crossovers using process() — includes forming
-                # alt-TF bar (drop_incomplete=False) to match TV real-time
-                # detection.  Only fires when transition is on the last bar.
-                engine = SignalEngine(cfg)
-                signal = engine.process(df)
+            logger.info("Signal scanner: new %s candle — rescanning %d symbols",
+                         tf_label, len(state["active_symbols"]))
 
-                # All simulator mutations inside a single lock acquisition
-                with _sim_lock:
-                    # ── TP/SL check on last closed candle's high/low ──
-                    if sim.has_position(sym):
-                        candle_high = float(last_closed["high"])
-                        candle_low = float(last_closed["low"])
-                        close_time = int(last_closed.get("close_time", 0))
-                        exit_trades = sim.process_candle(sym, candle_high, candle_low, close_time)
-                        for t in exit_trades:
-                            state["signal_log"].append({
-                                "time": time.strftime("%H:%M:%S"),
-                                "symbol": sym,
-                                "side": t.side,
-                                "price": t.exit_price,
-                                "rsi": 0,
-                                "source": f"EXIT_{t.exit_reason}",
-                            })
-                        # Update scan_results if position fully closed by TP/SL
-                        if not sim.has_position(sym):
-                            state["scan_results"][sym] = {
-                                "status": "closed_tp",
-                                "side": state["scan_results"].get(sym, {}).get("side", ""),
-                                "price": state["scan_results"].get(sym, {}).get("price", 0),
-                                "last_price": float(last_closed["close"]),
-                            }
+            for sym in list(state["active_symbols"]):
+                if not state["bot_running"]:
+                    break
+                try:
+                    klines = rest.fetch_klines_sync(sym, interval, limit=1500)
+                    if len(klines) < 200:
+                        continue
 
-                    if signal:
-                        # Only act if direction differs from current position
-                        has_pos = sim.has_position(sym)
-                        if has_pos:
-                            existing = sim.positions[sym]
-                            if existing.side == signal.side:
-                                continue  # same direction — skip
-                        # New signal or reversal
-                        reversal_trades = sim.process_signal(signal)
-                        for rt in reversal_trades:
-                            state["signal_log"].append({
-                                "time": time.strftime("%H:%M:%S"),
-                                "symbol": sym,
-                                "side": rt.side,
-                                "price": rt.exit_price,
-                                "rsi": 0,
-                                "source": f"EXIT_{rt.exit_reason}",
-                            })
+                    last_closed = klines[-2] if len(klines) >= 2 else klines[-1]
+                    klines_for_signal = klines[:-1]
 
-                        # Log TP/SL levels for TV comparison
-                        pos = sim.positions.get(sym)
-                        if pos and pos.condition != 0.0:
-                            logger.info(
-                                "[ENTRY] %s %s @ %.4f | TP1=%.4f TP2=%.4f TP3=%.4f SL=%.4f",
-                                sym, signal.side, signal.price,
-                                pos.tp1_line, pos.tp2_line, pos.tp3_line, pos.sl_line,
+                    df = pd.DataFrame(klines_for_signal)
+                    df["symbol"] = sym
+
+                    engine = SignalEngine(cfg, tf_config=tf_cfg)
+                    signal = engine.process(df)
+
+                    # DCA/TP check on last closed candle
+                    with _sim_lock:
+                        if sim.has_position(sym, tf_label):
+                            candle_high = float(last_closed["high"])
+                            candle_low = float(last_closed["low"])
+                            close_time_val = int(last_closed.get("close_time", 0))
+                            exit_trades = sim.process_candle(
+                                sym, candle_high, candle_low, close_time_val, tf_label=tf_label,
                             )
+                            for t in exit_trades:
+                                state["signal_log"].append({
+                                    "time": time.strftime("%H:%M:%S"),
+                                    "symbol": sym, "side": t.side,
+                                    "price": t.exit_price, "rsi": 0,
+                                    "source": f"{t.exit_reason} [{tf_label}]",
+                                })
 
-                        state["signal_log"].append({
-                            "time": time.strftime("%H:%M:%S"),
-                            "symbol": sym,
-                            "side": signal.side,
-                            "price": signal.price,
-                            "rsi": round(signal.rsi_value, 2),
-                            "source": "LIVE_SCAN",
-                        })
-                        logger.info("Signal scanner: %s %s @ %.4f",
-                                    sym, signal.side, signal.price)
+                    # PMax reversal = kill switch
+                    if signal:
+                        with _sim_lock:
+                            pos_key = f"{sym}:{tf_label}"
+                            has_pos = sim.has_position(sym, tf_label)
+                            if has_pos:
+                                existing = sim.positions.get(pos_key)
+                                if existing and existing.side == signal.side:
+                                    continue
+                            reversal_trades = sim.process_signal(signal)
+                            for rt in reversal_trades:
+                                state["signal_log"].append({
+                                    "time": time.strftime("%H:%M:%S"),
+                                    "symbol": sym, "side": rt.side,
+                                    "price": rt.exit_price, "rsi": 0,
+                                    "source": f"REVERSAL [{tf_label}]",
+                                })
 
-                        # Update scan_results
-                        state["scan_results"][sym] = {
-                            "status": "signal",
-                            "side": signal.side,
-                            "price": signal.price,
-                            "rsi": round(signal.rsi_value, 2),
-                            "atr": round(signal.atr_value, 4),
-                            "last_price": float(df["close"].iloc[-1]),
-                        }
+                            pos = sim.positions.get(pos_key)
+                            if pos and pos.condition != 0.0:
+                                logger.info(
+                                    "[ENTRY] %s %s [%s] @ %.4f",
+                                    sym, signal.side, tf_label, signal.price,
+                                )
 
-            except Exception as e:
-                logger.error("Signal scanner error for %s: %s", sym, str(e)[:100])
+                            state["signal_log"].append({
+                                "time": time.strftime("%H:%M:%S"),
+                                "symbol": sym, "side": signal.side,
+                                "price": signal.price,
+                                "rsi": round(signal.rsi_value, 2),
+                                "source": f"LIVE_SCAN [{tf_label}]",
+                            })
+                            logger.info("Signal scanner: %s %s [%s] @ %.4f",
+                                        sym, signal.side, tf_label, signal.price)
+
+                except Exception as e:
+                    logger.error("Signal scanner error for %s [%s]: %s",
+                                 sym, tf_label, str(e)[:100])
 
 
 def _get_sim() -> Simulator:
@@ -309,135 +286,118 @@ def start_bot(body: dict):
     scan_results = {}
     signal_log = []
 
+    # Get timeframe configs
+    tf_configs = cfg["strategy"].get("timeframes", [])
+    if not tf_configs:
+        tf_configs = [{"label": "1m", "timeframe": "1m", "size_multiplier": 1,
+                       "pmax": cfg["strategy"].get("pmax", {}),
+                       "filters": cfg["strategy"].get("filters", {}),
+                       "risk": cfg.get("risk", {})}]
+
     for sym in symbols:
+        scan_results[sym] = {"status": "monitoring", "last_price": 0, "timeframes": {}}
         try:
-            klines = rest.fetch_klines_sync(sym, cfg["strategy"]["timeframe"], limit=1500)
-            # Drop incomplete current candle
-            if len(klines) > 1:
-                klines = klines[:-1]
-            if len(klines) < 200:
-                scan_results[sym] = {
-                    "status": "insufficient_data",
-                    "candles": len(klines),
-                    "last_price": klines[-1]["close"] if klines else 0,
-                }
-                continue
+            for tf_cfg in tf_configs:
+                tf_label = tf_cfg.get("label", "1m")
+                interval = tf_cfg.get("timeframe", "1m")
 
-            df = pd.DataFrame(klines)
-            df["symbol"] = sym
+                klines = rest.fetch_klines_sync(sym, interval, limit=1500)
+                if len(klines) > 1:
+                    klines = klines[:-1]
+                if len(klines) < 200:
+                    scan_results[sym]["timeframes"][tf_label] = {
+                        "status": "insufficient_data", "candles": len(klines),
+                    }
+                    continue
 
-            engine = SignalEngine(cfg)
-            signal = engine.process_backfill(df)
+                df = pd.DataFrame(klines)
+                df["symbol"] = sym
 
-            # Also check forming bar for a more recent crossover
-            # process_backfill uses drop_incomplete=True so it misses
-            # crossovers on the forming alt-TF bar.  process() includes
-            # it (drop_incomplete=False) — matching TradingView real-time.
-            live_signal = engine.process(df)
-            if live_signal:
-                # Forming bar has a NEW crossover — use it instead
-                if signal is None or live_signal.side != signal.side:
-                    logger.info(
-                        "[INIT] %s forming-bar override: backfill=%s → live=%s",
-                        sym,
-                        signal.side if signal else "None",
-                        live_signal.side,
-                    )
-                    signal = live_signal
+                engine = SignalEngine(cfg, tf_config=tf_cfg)
+                # Only use backfill — show the last completed signal state
+                # Do NOT use process() to avoid triggering new reversals on start
+                signal = engine.process_backfill(df)
 
-            last_price = float(df["close"].iloc[-1])
+                last_price = float(df["close"].iloc[-1])
+                scan_results[sym]["last_price"] = last_price
 
-            if signal:
-                reversal_trades = sim.process_signal(signal)
-                for rt in reversal_trades:
+                if signal:
+                    # Open position from backfill with ATR grid
+                    sim.process_signal(signal)
+
+                    # Replay candles from entry — use full DataFrame for ALMA
+                    entry_ts = signal.timestamp
+                    entry_idx = df[df["open_time"] > entry_ts].index
+                    for idx in entry_idx:
+                        if not sim.has_position(sym, tf_label):
+                            break
+                        # Slice DataFrame up to this candle for ALMA calculation
+                        df_slice = df.iloc[:idx + 1]
+                        exit_trades = sim.process_candle_with_df(
+                            sym, df_slice, tf_label=tf_label,
+                        )
+                        for t in exit_trades:
+                            signal_log.append({
+                                "time": time.strftime("%H:%M:%S"),
+                                "symbol": sym, "side": t.side,
+                                "price": t.exit_price, "rsi": 0,
+                                "source": f"{t.exit_reason} [{tf_label}]",
+                            })
+
                     signal_log.append({
                         "time": time.strftime("%H:%M:%S"),
-                        "symbol": sym,
-                        "side": rt.side,
-                        "price": rt.exit_price,
-                        "rsi": 0,
-                        "source": f"EXIT_{rt.exit_reason}",
-                    })
-
-                # Replay candles from entry to now for TP/SL catch-up
-                entry_ts = signal.timestamp
-                for _, row in df.iterrows():
-                    if int(row["open_time"]) <= entry_ts:
-                        continue
-                    if not sim.has_position(sym):
-                        break
-                    exit_trades = sim.process_candle(
-                        sym, float(row["high"]), float(row["low"]),
-                        int(row.get("close_time", row["open_time"])),
-                    )
-                    for t in exit_trades:
-                        signal_log.append({
-                            "time": time.strftime("%H:%M:%S"),
-                            "symbol": sym,
-                            "side": t.side,
-                            "price": t.exit_price,
-                            "rsi": 0,
-                            "source": f"EXIT_{t.exit_reason}",
-                        })
-
-                entry = {
-                    "time": time.strftime("%H:%M:%S"),
-                    "symbol": sym,
-                    "side": signal.side,
-                    "price": signal.price,
-                    "rsi": round(signal.rsi_value, 2),
-                    "source": "INITIAL_SCAN",
-                }
-                signal_log.append(entry)
-
-                # Log TP/SL levels for TV verification
-                pos = sim.positions.get(sym)
-                if pos and pos.condition != 0.0:
-                    logger.info(
-                        "[INIT_ENTRY] %s %s @ %.4f | TP1=%.4f TP2=%.4f TP3=%.4f SL=%.4f",
-                        sym, signal.side, signal.price,
-                        pos.tp1_line, pos.tp2_line, pos.tp3_line, pos.sl_line,
-                    )
-
-                # Determine status based on whether position survived replay
-                if sim.has_position(sym):
-                    scan_results[sym] = {
-                        "status": "signal",
-                        "side": signal.side,
+                        "symbol": sym, "side": signal.side,
                         "price": signal.price,
                         "rsi": round(signal.rsi_value, 2),
-                        "atr": round(signal.atr_value, 4),
-                        "last_price": last_price,
-                    }
+                        "source": f"INITIAL_SCAN [{tf_label}]",
+                    })
+
+                    pos_key = f"{sym}:{tf_label}"
+                    pos = sim.positions.get(pos_key)
+                    if pos and pos.condition != 0.0:
+                        logger.info(
+                            "[INIT_ENTRY] %s %s [%s] @ %.4f",
+                            sym, signal.side, tf_label, signal.price,
+                        )
+
+                    if sim.has_position(sym, tf_label):
+                        scan_results[sym]["status"] = "signal"
+                        scan_results[sym]["timeframes"][tf_label] = {
+                            "status": "signal", "side": signal.side,
+                            "price": signal.price,
+                            "rsi": round(signal.rsi_value, 2),
+                        }
+                    else:
+                        scan_results[sym]["timeframes"][tf_label] = {
+                            "status": "closed_tp", "side": signal.side,
+                        }
                 else:
-                    scan_results[sym] = {
-                        "status": "closed_tp",
-                        "side": signal.side,
-                        "price": signal.price,
-                        "last_price": last_price,
+                    from core.strategy.indicators import pmax as calc_pmax, rsi as calc_rsi
+                    pmax_cfg = tf_cfg.get("pmax", {})
+                    src_type = pmax_cfg.get("source", "hl2").lower()
+                    if src_type == "hl2":
+                        src = (df["high"] + df["low"]) / 2
+                    elif src_type == "hlc3":
+                        src = (df["high"] + df["low"] + df["close"]) / 3
+                    elif src_type == "ohlc4":
+                        src = (df["open"] + df["high"] + df["low"] + df["close"]) / 4
+                    else:
+                        src = df["close"]
+                    _, mavg, direction = calc_pmax(
+                        src, df["high"], df["low"], df["close"],
+                        atr_period=pmax_cfg.get("atr_period", 10),
+                        atr_multiplier=pmax_cfg.get("atr_multiplier", 3.0),
+                        ma_type=pmax_cfg.get("ma_type", "EMA"),
+                        ma_length=pmax_cfg.get("ma_length", 10),
+                        change_atr=pmax_cfg.get("change_atr", True),
+                        normalize_atr=pmax_cfg.get("normalize_atr", False),
+                    )
+                    trend = "BULLISH" if direction.iloc[-1] == 1 else "BEARISH"
+                    rsi_val = calc_rsi(df["close"], 28).iloc[-1]
+                    scan_results[sym]["timeframes"][tf_label] = {
+                        "status": "monitoring", "trend": trend,
+                        "rsi": round(float(rsi_val), 2),
                     }
-            else:
-                from core.strategy.indicators import variant, rsi as calc_rsi
-                close_ma = variant(
-                    cfg["strategy"]["ma_type"], df["close"],
-                    cfg["strategy"]["ma_period"],
-                    cfg["strategy"]["alma_sigma"],
-                    cfg["strategy"]["alma_offset"],
-                )
-                open_ma = variant(
-                    cfg["strategy"]["ma_type"], df["open"],
-                    cfg["strategy"]["ma_period"],
-                    cfg["strategy"]["alma_sigma"],
-                    cfg["strategy"]["alma_offset"],
-                )
-                trend = "BULLISH" if close_ma.iloc[-1] > open_ma.iloc[-1] else "BEARISH"
-                rsi_val = calc_rsi(df["close"], 28).iloc[-1]
-                scan_results[sym] = {
-                    "status": "monitoring",
-                    "trend": trend,
-                    "last_price": last_price,
-                    "rsi": round(float(rsi_val), 2),
-                }
         except Exception as e:
             scan_results[sym] = {"status": "error", "message": str(e)[:100], "last_price": 0}
 
@@ -556,25 +516,33 @@ def get_status():
     if sim:
         # Lock ensures scanner thread can't mutate positions mid-read
         with _sim_lock:
-            position_snapshot = [(sym, pos) for sym, pos in sim.positions.items()
+            position_snapshot = [(pos_key, pos) for pos_key, pos in sim.positions.items()
                                  if pos.condition != 0.0]
-        for sym, pos in position_snapshot:
-            # LIVE mark price from orderbook (realistic: LONG=ask, SHORT=bid)
-            ob = orderbook.get(sym)
+        for pos_key, pos in position_snapshot:
+            # Extract symbol and tf_label from key "BTCUSDT:1m"
+            symbol_raw = pos.symbol  # pure symbol e.g. "BTCUSDT"
+            tf_label = ""
+            if ":" in pos_key:
+                tf_label = pos_key.rsplit(":", 1)[1]
+
+            # Size multiplier for this TF
+            size_mult = sim._size_multipliers.get(pos_key, 1.0)
+
+            # LIVE mark price from orderbook (key is pure symbol)
+            ob = orderbook.get(symbol_raw)
             if ob:
                 mark_price = _mark_price_from_book(ob, pos.side)
                 bid = ob["bid"]
                 ask = ob["ask"]
                 spread = ask - bid
             else:
-                mark_price = state["scan_results"].get(sym, {}).get("last_price", pos.entry_price)
+                mark_price = state["scan_results"].get(symbol_raw, {}).get("last_price", pos.entry_price)
                 bid = mark_price
                 ask = mark_price
                 spread = 0.0
 
-            # Notional size (TP/SL now checked in signal scanner on candle close)
-            notional = margin * leverage
-            position_notional = notional * pos.remaining_qty
+            # Notional from actual position state (includes DCA fills)
+            position_notional = pos.total_position_notional if pos.total_position_notional > 0 else margin * size_mult * leverage
 
             # Unrealized PnL (LIVE)
             if pos.side == "LONG":
@@ -583,26 +551,25 @@ def get_status():
                 upnl_pct = (pos.entry_price - mark_price) / pos.entry_price * 100
             upnl_usdt = position_notional * upnl_pct / 100
 
-            # Break-even price (entry taker fee + exit maker fee estimate)
+            # Break-even price
             total_fee_pct = taker_fee + maker_fee
             if pos.side == "LONG":
                 break_even = pos.entry_price * (1 + total_fee_pct)
             else:
                 break_even = pos.entry_price * (1 - total_fee_pct)
 
-            # Realized PnL from partial exits
-            realized = sum(t.pnl_usdt for t in sim.trades if t.symbol == sym)
-            realized_fees = sum(t.fee_usdt for t in sim.trades if t.symbol == sym)
+            # Realized PnL — match by pos_key via tf_label
+            realized = sum(t.pnl_usdt for t in sim.trades
+                           if t.symbol == symbol_raw and t.tf_label == tf_label)
+            realized_fees = sum(t.fee_usdt for t in sim.trades
+                                if t.symbol == symbol_raw and t.tf_label == tf_label)
 
-            # Entry fee for this position (market order = taker fee)
-            full_notional = margin * leverage
-            entry_fee = full_notional * taker_fee
-
-            # Total fees = entry fee + any exit fees from partial TPs
+            # Entry fee
+            entry_fee = position_notional * taker_fee
             total_fees_for_pos = entry_fee + realized_fees
 
             positions.append({
-                "symbol": sym,
+                "symbol": pos_key,  # "BTCUSDT:1m" — so frontend shows TF
                 "side": pos.side,
                 "entry_price": pos.entry_price,
                 "mark_price": round(mark_price, 4),
@@ -611,10 +578,6 @@ def get_status():
                 "spread": round(spread, 6),
                 "break_even": round(break_even, 4),
                 "notional_usdt": round(position_notional, 2),
-                "tp1": pos.tp1_line,
-                "tp2": pos.tp2_line,
-                "tp3": pos.tp3_line,
-                "sl": pos.sl_line,
                 "condition": pos.condition,
                 "remaining_qty": pos.remaining_qty,
                 "unrealized_pnl_usdt": round(upnl_usdt, 4),
@@ -622,6 +585,7 @@ def get_status():
                 "realized_pnl_usdt": round(realized, 4),
                 "total_pnl_usdt": round(upnl_usdt + realized, 4),
                 "fees_usdt": round(total_fees_for_pos, 4),
+                "grid": RiskManager({}).get_grid_info(pos) if hasattr(pos, 'dca_levels') else None,
             })
 
     # Refresh stats after possible TP/SL exits
@@ -642,8 +606,11 @@ def get_status():
         sym_realized = sum(t.pnl_usdt for t in sym_trades)
         sym_fees = sum(t.fee_usdt for t in sym_trades)
 
-        pos_match = next((p for p in positions if p["symbol"] == sym), None)
-        sym_unrealized = pos_match["unrealized_pnl_usdt"] if pos_match else 0.0
+        # Sum unrealized PnL across all TFs for this symbol
+        sym_unrealized = sum(
+            p["unrealized_pnl_usdt"] for p in positions
+            if p["symbol"].startswith(sym + ":") or p["symbol"] == sym
+        )
         current_price = live_prices.get(sym, state["scan_results"].get(sym, {}).get("last_price", 0))
 
         ob = orderbook.get(sym, {})
@@ -704,6 +671,172 @@ def get_status():
             "total_fees": fee_breakdown["total"],
             "net_pnl": round(total_unrealized + total_realized - fee_breakdown["total"], 4),
         },
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════
+# CHART DATA ENDPOINT — OHLC + PMax + trade markers
+# ══════════════════════════════════════════════════════════════════════
+
+@app.get("/api/chart-data")
+def get_chart_data(symbol: str = "BTCUSDT", limit: int = 500):
+    """Return OHLC candles + PMax indicator + trade markers for charting."""
+    cfg = state["config"]
+    rest: BinanceRest = state["rest"]
+
+    tf_configs = cfg["strategy"].get("timeframes", [])
+    if not tf_configs:
+        return {"error": "No timeframes configured"}
+    tf_cfg = tf_configs[0]
+    interval = tf_cfg.get("timeframe", "3m")
+
+    # Fetch klines
+    try:
+        klines = rest.fetch_klines_sync(symbol, interval, limit=limit)
+    except Exception as e:
+        return {"error": str(e)}
+
+    if len(klines) < 50:
+        return {"error": "Insufficient data"}
+
+    df = pd.DataFrame(klines)
+    df["symbol"] = symbol
+
+    # Compute PMax
+    from core.strategy.indicators import pmax as calc_pmax
+    pmax_cfg = tf_cfg.get("pmax", {})
+    src_type = pmax_cfg.get("source", "hl2").lower()
+    if src_type == "hl2":
+        src = (df["high"] + df["low"]) / 2
+    elif src_type == "hlc3":
+        src = (df["high"] + df["low"] + df["close"]) / 3
+    elif src_type == "ohlc4":
+        src = (df["open"] + df["high"] + df["low"] + df["close"]) / 4
+    else:
+        src = df["close"]
+
+    pmax_line, mavg, direction = calc_pmax(
+        src, df["high"], df["low"], df["close"],
+        atr_period=pmax_cfg.get("atr_period", 10),
+        atr_multiplier=pmax_cfg.get("atr_multiplier", 3.0),
+        ma_type=pmax_cfg.get("ma_type", "EMA"),
+        ma_length=pmax_cfg.get("ma_length", 10),
+        change_atr=pmax_cfg.get("change_atr", True),
+        normalize_atr=pmax_cfg.get("normalize_atr", False),
+    )
+
+    # Compute Keltner Channel
+    from core.strategy.indicators import keltner_channel as calc_kc
+    kc_cfg = tf_cfg.get("keltner", {})
+    kc_mid, kc_upper_line, kc_lower_line = calc_kc(
+        df["high"], df["low"], df["close"],
+        kc_length=kc_cfg.get("length", 20),
+        kc_multiplier=kc_cfg.get("multiplier", 1.5),
+        atr_period=kc_cfg.get("atr_period", 10),
+    )
+
+    # Build candle data
+    candles = []
+    for i, row in df.iterrows():
+        t = int(row["open_time"]) // 1000
+        pmax_val = float(pmax_line.iloc[i]) if not pd.isna(pmax_line.iloc[i]) else None
+        kc_upper_val = float(kc_upper_line.iloc[i]) if not pd.isna(kc_upper_line.iloc[i]) else None
+        kc_lower_val = float(kc_lower_line.iloc[i]) if not pd.isna(kc_lower_line.iloc[i]) else None
+        mavg_val = float(kc_mid.iloc[i]) if not pd.isna(kc_mid.iloc[i]) else None
+        dir_val = int(direction.iloc[i]) if not pd.isna(direction.iloc[i]) else 0
+        candles.append({
+            "time": t,
+            "open": float(row["open"]),
+            "high": float(row["high"]),
+            "low": float(row["low"]),
+            "close": float(row["close"]),
+            "pmax": pmax_val,
+            "mavg": mavg_val,
+            "kc_upper": kc_upper_val,
+            "kc_lower": kc_lower_val,
+            "direction": dir_val,
+        })
+
+    # Build trade markers from simulator
+    markers = []
+    sim = state.get("simulator")
+    if sim:
+        for trade in sim.trades:
+            if trade.symbol != symbol:
+                continue
+            t = trade.entry_time // 1000 if trade.entry_time > 0 else 0
+            exit_t = trade.exit_time // 1000 if trade.exit_time > 0 else 0
+
+            reason = trade.exit_reason
+            if reason.startswith("DCA"):
+                # DCA entry marker
+                markers.append({
+                    "time": exit_t or t,
+                    "position": "belowBar" if trade.side == "LONG" else "aboveBar",
+                    "color": "#22c55e" if trade.side == "LONG" else "#ef4444",
+                    "shape": "arrowUp" if trade.side == "LONG" else "arrowDown",
+                    "text": reason,
+                    "price": trade.entry_price,
+                })
+            elif reason == "TP":
+                markers.append({
+                    "time": exit_t,
+                    "position": "aboveBar" if trade.side == "LONG" else "belowBar",
+                    "color": "#3b82f6",
+                    "shape": "circle",
+                    "text": f"TP +{trade.pnl_usdt:.2f}",
+                    "price": trade.exit_price,
+                })
+            elif reason == "REVERSAL":
+                markers.append({
+                    "time": exit_t,
+                    "position": "aboveBar",
+                    "color": "#f59e0b",
+                    "shape": "square",
+                    "text": f"REV {trade.pnl_usdt:+.2f}",
+                    "price": trade.exit_price,
+                })
+
+        # Add initial entry marker for open positions
+        tf_label = tf_cfg.get("label", "3m")
+        pos_key = f"{symbol}:{tf_label}"
+        pos = sim.positions.get(pos_key)
+        if pos and pos.condition != 0.0:
+            entry_t = pos.entry_time // 1000 if pos.entry_time > 0 else 0
+            markers.append({
+                "time": entry_t,
+                "position": "belowBar" if pos.side == "LONG" else "aboveBar",
+                "color": "#22c55e" if pos.side == "LONG" else "#ef4444",
+                "shape": "arrowUp" if pos.side == "LONG" else "arrowDown",
+                "text": f"ENTRY {pos.side}",
+                "price": pos.initial_entry_price,
+            })
+
+            # Add DCA level lines
+            grid_levels = []
+            for dca in pos.dca_levels:
+                grid_levels.append({
+                    "price": dca.price,
+                    "label": f"DCA{dca.step}",
+                    "filled": dca.filled,
+                })
+            # TP line
+            if pos.tp_price > 0:
+                grid_levels.append({
+                    "price": pos.tp_price,
+                    "label": "TP",
+                    "filled": False,
+                })
+
+    # Sort markers by time
+    markers.sort(key=lambda m: m["time"])
+
+    return {
+        "symbol": symbol,
+        "interval": interval,
+        "candles": candles,
+        "markers": markers,
+        "grid_levels": grid_levels if sim and pos and pos.condition != 0.0 else [],
     }
 
 
@@ -1009,9 +1142,8 @@ def _live_signal_scanner_loop() -> None:
                         pos = executor.positions.get(sym)
                         if pos and pos.condition != 0.0:
                             logger.info(
-                                "[LIVE_ENTRY] %s %s @ %.4f | TP1=%.4f TP2=%.4f TP3=%.4f SL=%.4f",
+                                "[LIVE_ENTRY] %s %s @ %.4f",
                                 sym, signal.side, signal.price,
-                                pos.tp1_line, pos.tp2_line, pos.tp3_line, pos.sl_line,
                             )
 
                         _live_state["signal_log"].append({
@@ -1174,20 +1306,27 @@ def live_start(body: dict):
                     "source": "INITIAL_SCAN",
                 })
             else:
-                from core.strategy.indicators import variant, rsi as calc_rsi
-                close_ma = variant(
-                    cfg["strategy"]["ma_type"], df["close"],
-                    cfg["strategy"]["ma_period"],
-                    cfg["strategy"]["alma_sigma"],
-                    cfg["strategy"]["alma_offset"],
+                from core.strategy.indicators import pmax as calc_pmax, rsi as calc_rsi
+                pmax_cfg = cfg["strategy"].get("pmax", {})
+                src_type = pmax_cfg.get("source", "hl2").lower()
+                if src_type == "hl2":
+                    src = (df["high"] + df["low"]) / 2
+                elif src_type == "hlc3":
+                    src = (df["high"] + df["low"] + df["close"]) / 3
+                elif src_type == "ohlc4":
+                    src = (df["open"] + df["high"] + df["low"] + df["close"]) / 4
+                else:
+                    src = df["close"]
+                _, mavg, direction = calc_pmax(
+                    src, df["high"], df["low"], df["close"],
+                    atr_period=pmax_cfg.get("atr_period", 10),
+                    atr_multiplier=pmax_cfg.get("atr_multiplier", 3.0),
+                    ma_type=pmax_cfg.get("ma_type", "EMA"),
+                    ma_length=pmax_cfg.get("ma_length", 10),
+                    change_atr=pmax_cfg.get("change_atr", True),
+                    normalize_atr=pmax_cfg.get("normalize_atr", False),
                 )
-                open_ma = variant(
-                    cfg["strategy"]["ma_type"], df["open"],
-                    cfg["strategy"]["ma_period"],
-                    cfg["strategy"]["alma_sigma"],
-                    cfg["strategy"]["alma_offset"],
-                )
-                trend = "BULLISH" if close_ma.iloc[-1] > open_ma.iloc[-1] else "BEARISH"
+                trend = "BULLISH" if direction.iloc[-1] == 1 else "BEARISH"
                 rsi_val = calc_rsi(df["close"], 28).iloc[-1]
                 scan_results[sym] = {
                     "status": "monitoring",
@@ -1404,10 +1543,6 @@ def live_status():
             "ask": round(ask, 4),
             "spread": round(spread, 6),
             "notional_usdt": round(notional, 2),
-            "tp1": pos.tp1_line,
-            "tp2": pos.tp2_line,
-            "tp3": pos.tp3_line,
-            "sl": pos.sl_line,
             "condition": pos.condition,
             "remaining_qty": pos.remaining_qty,
             "unrealized_pnl_usdt": round(upnl_usdt, 4),

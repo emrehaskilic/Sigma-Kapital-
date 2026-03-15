@@ -8,10 +8,6 @@ export interface Position {
   spread: number;
   break_even: number;
   notional_usdt: number;
-  tp1: number;
-  tp2: number;
-  tp3: number;
-  sl: number;
   condition: number;
   remaining_qty: number;
   unrealized_pnl_usdt: number;
@@ -101,6 +97,28 @@ export interface StatusResponse {
   totals: Totals;
 }
 
+export interface PMaxConfig {
+  source: string;
+  atr_period: number;
+  atr_multiplier: number;
+  ma_type: string;
+  ma_length: number;
+  change_atr: boolean;
+  normalize_atr: boolean;
+}
+
+export interface TimeframeConfig {
+  label: string;
+  timeframe: string;
+  size_multiplier: number;
+  pmax: PMaxConfig;
+  filters: {
+    ema_trend: { enabled: boolean; period: number };
+    rsi: { enabled: boolean; period: number; overbought: number; oversold: number };
+    atr_volatility: { enabled: boolean; atr_period: number; min_atr_percentile: number };
+  };
+}
+
 export interface Config {
   trading: {
     initial_balance: number;
@@ -110,27 +128,10 @@ export interface Config {
     maker_fee: number;
     taker_fee: number;
     max_pairs: number;
+    hedge_mode: boolean;
   };
   strategy: {
-    timeframe: string;
-    ma_type: string;
-    ma_period: number;
-    alma_offset: number;
-    alma_sigma: number;
-    use_alternate_signals: boolean;
-    alternate_multiplier: number;
-    swing_length: number;
-    history_to_keep: number;
-    supply_demand_box_width: number;
-  };
-  risk: {
-    tp1_level: number;
-    tp1_qty: number;
-    tp2_level: number;
-    tp2_qty: number;
-    tp3_level: number;
-    tp3_qty: number;
-    stop_loss: number;
+    timeframes: TimeframeConfig[];
   };
 }
 
