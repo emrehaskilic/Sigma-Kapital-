@@ -1,13 +1,13 @@
-"""Generate PMax Strategy Documentation PDF."""
+"""Generate PMax + Keltner Channel Strategy Documentation PDF."""
 from fpdf import FPDF
 
 
 class PDF(FPDF):
     def header(self):
         self.set_font("Helvetica", "B", 14)
-        self.cell(0, 10, "Scalper Bot - PMax Strategy Documentation", align="C", new_x="LMARGIN", new_y="NEXT")
+        self.cell(0, 10, "Sigma Kapital - Scalper Bot Strategy", align="C", new_x="LMARGIN", new_y="NEXT")
         self.set_font("Helvetica", "", 8)
-        self.cell(0, 5, "3m Profit Maximizer (PMax) Trading Strategy", align="C", new_x="LMARGIN", new_y="NEXT")
+        self.cell(0, 5, "PMax + Keltner Channel DCA/TP Trading System", align="C", new_x="LMARGIN", new_y="NEXT")
         self.ln(5)
 
     def footer(self):
@@ -58,216 +58,204 @@ pdf.set_auto_page_break(auto=True, margin=20)
 pdf.add_page()
 
 # 1. OVERVIEW
-pdf.section_title("1. Genel Bakis (Overview)")
+pdf.section_title("1. Genel Bakis")
 pdf.body_text(
-    "Bu bot, KivancOzbilgic tarafindan gelistirilen Profit Maximizer (PMax) "
-    "indikatorunu kullanarak Binance Futures uzerinde otomatik islem yapan bir scalper bottir."
+    "Bu bot, Binance USDT-M Futures uzerinde 3 dakikalik (3m) zaman diliminde calisan "
+    "bir scalper bottir. Iki ana indikator kullanir:"
 )
+pdf.bullet("PMax (Profit Maximizer): Makro trend yonunu belirler (LONG/SHORT)")
+pdf.bullet("Keltner Channel (KC): Mikro DCA/TP seviyelerini belirler")
 pdf.body_text(
-    "Bot, 3 dakikalik zaman diliminde PMax sinyalleri uretir. "
-    "Pozisyonlar sadece crossover reversal ile kapatilir, TP/SL kullanilmaz. "
-    "Bu yaklasim PMax indikatorunun orijinal mantigina sadik kalir."
-)
-
-pdf.sub_title("Temel Ozellikler:")
-pdf.bullet("Timeframe: 3 dakika (3m)")
-pdf.bullet("Cikis: Sadece crossover reversal ile (TP/SL yok)")
-pdf.bullet("Giris: MAvg, PMax cizgisini kestigi anda")
-pdf.bullet("Islem tipi: BOTH (hem LONG hem SHORT)")
-pdf.bullet("Borsa: Binance USDT-M Futures")
-pdf.ln(3)
-
-# 2. PMAX INDICATOR
-pdf.section_title("2. PMax Indikatoru")
-pdf.body_text(
-    "PMax (Profit Maximizer), ATR tabanli bir trailing stop mekanizmasidir. "
-    "Supertrend indikatorune benzer ancak fiyat yerine bir hareketli ortalama "
-    "(Moving Average) uzerine uygulanir."
-)
-
-pdf.sub_title("2.1 Hesaplama Adimlari:")
-pdf.body_text("Adim 1 - ATR Hesaplama:")
-pdf.code_block(
-    "ATR = RMA(True Range, ATR_Period)  // Wilder method\n"
-    "True Range = max(High-Low, |High-PrevClose|, |Low-PrevClose|)"
-)
-
-pdf.body_text("Adim 2 - Hareketli Ortalama (MAvg):")
-pdf.code_block(
-    "MAvg = EMA(Source, MA_Length)  // varsayilan\n"
-    "Source = (High + Low) / 2     // hl2"
-)
-pdf.body_text("Desteklenen MA turleri: SMA, EMA, WMA, TMA, VAR, WWMA, ZLEMA, TSF")
-
-pdf.body_text("Adim 3 - Long Stop ve Short Stop:")
-pdf.code_block(
-    "LongStop  = MAvg - (ATR_Multiplier * ATR)\n"
-    "ShortStop = MAvg + (ATR_Multiplier * ATR)\n"
-    "\n"
-    "// Trailing mantigi:\n"
-    "LongStop  = max(LongStop, PrevLongStop)   eger MAvg > PrevLongStop\n"
-    "ShortStop = min(ShortStop, PrevShortStop) eger MAvg < PrevShortStop"
-)
-
-pdf.body_text("Adim 4 - Yon Belirleme (Direction):")
-pdf.code_block(
-    "Eger PrevDirection = -1 VE MAvg > PrevShortStop => Direction = 1 (YUKARI)\n"
-    "Eger PrevDirection =  1 VE MAvg < PrevLongStop  => Direction = -1 (ASAGI)"
-)
-
-pdf.body_text("Adim 5 - PMax Cizgisi:")
-pdf.code_block("PMax = Direction == 1 ? LongStop : ShortStop")
-pdf.ln(2)
-
-# 3. SIGNAL LOGIC
-pdf.section_title("3. Sinyal Mantigi")
-pdf.body_text("Sinyaller, MAvg ile PMax cizgisinin kesisiminden uretilir:")
-
-pdf.sub_title("LONG (Alis) Sinyali:")
-pdf.code_block(
-    "Onceki bar: MAvg <= PMax\n"
-    "Mevcut bar: MAvg >  PMax\n"
-    "=> MAvg, PMax cizgisini YUKARI kesti"
-)
-
-pdf.sub_title("SHORT (Satis) Sinyali:")
-pdf.code_block(
-    "Onceki bar: MAvg >= PMax\n"
-    "Mevcut bar: MAvg <  PMax\n"
-    "=> MAvg, PMax cizgisini ASAGI kesti"
-)
-
-pdf.body_text(
-    "Onemli: Pozisyon sadece TERS YONDE bir crossover oldugunda kapanir. "
-    "TP (Take Profit) ve SL (Stop Loss) YOKTUR. "
-    "Bu, PMax indikatorunun orijinal mantigina sadik kalir."
+    "Sistem, PMax ile trendi yakalar ve Keltner bantlarina limit emirler koyarak "
+    "trendin icindeki mikro dalgalardan kar toplar. Tum DCA ve TP emirleri "
+    "MAKER (Post-Only/GTX) olarak gonderilir - komisyon optimizasyonu saglanir."
 )
 pdf.ln(2)
 
-# 4. POSITION LIFECYCLE
-pdf.section_title("4. Pozisyon Yasam Dongusu")
-
-pdf.sub_title("Giris (Entry):")
-pdf.bullet("MAvg, PMax cizgisini yukari keserse => LONG pozisyon acilir")
-pdf.bullet("MAvg, PMax cizgisini asagi keserse => SHORT pozisyon acilir")
-pdf.bullet("Giris fiyati: Crossover mumunun kapanis fiyati (3m mum)")
-
-pdf.sub_title("Cikis (Exit):")
-pdf.bullet("Sadece TERS YONDE crossover ile kapatilir (Reversal)")
-pdf.bullet("LONG pozisyon: MAvg asagi kestiginde kapatilir ve SHORT acilir")
-pdf.bullet("SHORT pozisyon: MAvg yukari kestiginde kapatilir ve LONG acilir")
-pdf.bullet("TP/SL YOKTUR - tamamen crossover bazli")
-
-pdf.sub_title("Ornek Senaryo:")
-pdf.code_block(
-    "t=0  : MAvg PMax i yukari kesti  => LONG @ 70,000\n"
-    "t=45m: MAvg PMax i asagi kesti   => LONG kapatildi @ 70,500 (+0.71%)\n"
-    "                                    SHORT acildi @ 70,500\n"
-    "t=2h : MAvg PMax i yukari kesti  => SHORT kapatildi @ 69,800 (+1.00%)\n"
-    "                                    LONG acildi @ 69,800"
-)
-pdf.ln(2)
-
-# 5. FILTERS
-pdf.section_title("5. Sinyal Filtreleri")
+# 2. PMAX
+pdf.section_title("2. PMax Indikatoru - Trend Belirleme")
 pdf.body_text(
-    "Canli taramada (scanner loop) sinyaller su filtrelerden gecer. "
-    "Not: Backfill (baslangic simuelasyonu) sirasinda filtreler UYGULANMAZ."
+    "PMax, ATR tabanli bir trailing stop mekanizmasidir. Fiyat yerine "
+    "hareketli ortalama (MAvg) uzerine uygulanir."
 )
-
-pdf.sub_title("5.1 EMA Trend Filtresi:")
-pdf.bullet("Period: 144")
-pdf.bullet("LONG engellenir eger: Close < EMA(144)")
-pdf.bullet("SHORT engellenir eger: Close > EMA(144)")
-
-pdf.sub_title("5.2 RSI Filtresi:")
-pdf.bullet("Period: 28")
-pdf.bullet("LONG engellenir eger: RSI > 65 VE RSI > EMA(RSI, 10)")
-pdf.bullet("SHORT engellenir eger: RSI < 35 VE RSI < EMA(RSI, 10)")
-
-pdf.sub_title("5.3 ATR Volatilite Filtresi:")
-pdf.bullet("Period: 50")
-pdf.bullet("Sinyal engellenir eger: ATR < son 200 barin %20 percentile i")
-pdf.bullet("Dusuk volatiliteli piyasalarda islem yapmaz")
-pdf.ln(2)
-
-# 6. CONFIGURATION
-pdf.section_title("6. Yapilandirma (Configuration)")
-
-pdf.sub_title("PMax Parametreleri:")
+pdf.sub_title("Hesaplama:")
 pdf.code_block(
-    "timeframe: 3m        # 3 dakikalik mumlar\n"
-    "source: hl2          # Fiyat kaynagi (hl2, close, hlc3, ohlc4)\n"
-    "atr_period: 10       # ATR hesaplama periyodu\n"
-    "atr_multiplier: 3.0  # ATR carpani (band genisligi)\n"
-    "ma_type: EMA         # Hareketli ortalama turu\n"
-    "ma_length: 10        # Hareketli ortalama uzunlugu\n"
-    "change_atr: true     # Wilder ATR metodu (true) veya SMA (false)\n"
-    "normalize_atr: false # ATR yi fiyata gore normalize et"
+    "MAvg = EMA(Source, MA_Length)      // Source = (High+Low)/2\n"
+    "ATR  = RMA(TrueRange, ATR_Period)\n"
+    "LongStop  = MAvg - (ATR_Mult * ATR)   // destek\n"
+    "ShortStop = MAvg + (ATR_Mult * ATR)   // direnç\n"
+    "PMax = Direction==1 ? LongStop : ShortStop"
 )
-
-pdf.sub_title("Trading Parametreleri:")
+pdf.sub_title("Sinyal:")
+pdf.bullet("MAvg, PMax i yukari keserse => LONG sinyal")
+pdf.bullet("MAvg, PMax i asagi keserse => SHORT sinyal")
+pdf.sub_title("Mevcut Parametreler:")
 pdf.code_block(
-    "initial_balance: 1000  # Baslangic bakiyesi (USDT)\n"
-    "leverage: 10           # Kaldirac\n"
-    "margin_per_trade: 100  # Islem basina margin (USDT)\n"
-    "trade_type: BOTH       # LONG, SHORT veya BOTH\n"
-    "hedge_mode: false      # Tek yonlu pozisyon"
-)
-
-pdf.sub_title("Pozisyon Boyutlandirma:")
-pdf.code_block(
-    "3m: margin=100 x leverage=10 = 1,000 USDT notional"
+    "atr_period: 10\n"
+    "atr_multiplier: 3.0\n"
+    "ma_type: EMA\n"
+    "ma_length: 10"
 )
 pdf.ln(2)
 
-# 7. ARCHITECTURE
-pdf.section_title("7. Teknik Mimari")
-
-pdf.sub_title("Dosya Yapisi:")
+# 3. KELTNER CHANNEL
+pdf.section_title("3. Keltner Channel - DCA/TP Seviyeleri")
+pdf.body_text(
+    "Keltner Kanallari, EMA tabanli bir volatilite bandidir. "
+    "Ust ve alt bantlar ATR ile hesaplanir."
+)
+pdf.sub_title("Hesaplama:")
 pdf.code_block(
-    "core/strategy/indicators.py  -> PMax hesaplama, MA turleri, ATR\n"
-    "core/strategy/signals.py     -> SignalEngine: crossover algilama\n"
-    "core/strategy/risk_manager.py-> PositionState (TP/SL yok)\n"
+    "Middle = EMA(Close, KC_Length)\n"
+    "Upper  = Middle + (KC_Multiplier * ATR)\n"
+    "Lower  = Middle - (KC_Multiplier * ATR)"
+)
+pdf.sub_title("Kullanim:")
+pdf.bullet("LONG modda: KC Lower Band = DCA alim seviyesi (limit buy)")
+pdf.bullet("LONG modda: KC Upper Band = TP satis seviyesi (limit sell)")
+pdf.bullet("SHORT modda: KC Upper Band = DCA short ekleme seviyesi")
+pdf.bullet("SHORT modda: KC Lower Band = TP kapatma seviyesi")
+pdf.sub_title("Mevcut Parametreler:")
+pdf.code_block(
+    "kc_length: 20        # EMA periyodu\n"
+    "kc_multiplier: 1.5   # Bant genisligi\n"
+    "kc_atr_period: 10    # ATR periyodu"
+)
+pdf.ln(2)
+
+# 4. TRADING LOGIC
+pdf.section_title("4. Islem Mantigi")
+
+pdf.sub_title("4.1 Ilk Giris (PMax Crossover):")
+pdf.bullet("PMax LONG sinyali => Market BUY emri (taker fee: 0.05%)")
+pdf.bullet("PMax SHORT sinyali => Market SELL emri (taker fee: 0.05%)")
+
+pdf.sub_title("4.2 DCA (Maliyet Dusurme):")
+pdf.bullet("LONG: KC Lower Band a limit BUY emri konur (maker fee: 0.02%)")
+pdf.bullet("SHORT: KC Upper Band a limit SELL emri konur (maker fee: 0.02%)")
+pdf.bullet("Her dalga basina maksimum 2 DCA")
+pdf.bullet("Lot buyuklugu sabit (1x) - Martingale YOK")
+pdf.bullet("Her mumda emir iptal edilip yeni KC degerine tasinir (trailing)")
+
+pdf.sub_title("4.3 TP (Kar Alma):")
+pdf.bullet("LONG: KC Upper Band a limit SELL emri konur (maker fee: 0.02%)")
+pdf.bullet("SHORT: KC Lower Band a limit BUY emri konur (maker fee: 0.02%)")
+pdf.bullet("Her TP mevcut pozisyonun %20 sini kapatir")
+pdf.bullet("TP sadece DCA fill olduktan sonra aktif olur")
+pdf.bullet("Her mumda emir iptal edilip yeni KC degerine tasinir")
+
+pdf.sub_title("4.4 Kill Switch (PMax Reversal):")
+pdf.bullet("PMax ters sinyal verdiginde:")
+pdf.bullet("  1. Tum acik limit emirler iptal edilir (DCA + TP)")
+pdf.bullet("  2. Pozisyonun tamami market emriyle kapatilir (taker fee)")
+pdf.bullet("  3. Yeni yonde pozisyon acilir")
+pdf.ln(2)
+
+# 5. COMMISSION
+pdf.section_title("5. Komisyon Yapisi")
+pdf.code_block(
+    "Emir Tipi          | Yontem  | Fee\n"
+    "--------------------+---------+-------\n"
+    "Ilk giris (PMax)   | Market  | Taker 0.05%\n"
+    "DCA alim           | Limit   | Maker 0.02%\n"
+    "TP satis           | Limit   | Maker 0.02%\n"
+    "Kill switch kapanis| Market  | Taker 0.05%"
+)
+pdf.body_text(
+    "Limit emirler Binance API sine timeInForce='GTX' (Post-Only) ile gonderilir. "
+    "Bu sayede DCA ve TP emirlerinde sadece maker komisyonu odenir."
+)
+pdf.ln(2)
+
+# 6. WAVE CYCLE
+pdf.section_title("6. Dalga Dongusu")
+pdf.body_text("Bir trend icinde su dongu tekrarlanir:")
+pdf.code_block(
+    "1. PMax LONG sinyal => Market giris @ 70000\n"
+    "2. Fiyat KC Lower a duser => DCA limit buy @ 69800 (1. DCA)\n"
+    "3. Fiyat KC Lower a duser => DCA limit buy @ 69750 (2. DCA - max)\n"
+    "4. Fiyat KC Upper a cikar => TP limit sell @ 70100 (%20 kapatir)\n"
+    "5. Fiyat KC Upper a cikar => TP limit sell @ 70150 (%20 kapatir)\n"
+    "6. Dalga biter, DCA sayaci sifirlanir\n"
+    "7. Yeni dalga baslar: tekrar 2 DCA + TP dongusu\n"
+    "...\n"
+    "N. PMax SHORT sinyal => KILL SWITCH: hepsini kapat, SHORT ac"
+)
+pdf.ln(2)
+
+# 7. FILTERS
+pdf.section_title("7. Sinyal Filtreleri")
+pdf.sub_title("EMA Trend Filtresi (period=144):")
+pdf.bullet("LONG engellenir: Close < EMA(144)")
+pdf.bullet("SHORT engellenir: Close > EMA(144)")
+pdf.sub_title("RSI Filtresi (period=28):")
+pdf.bullet("LONG engellenir: RSI > 65 VE RSI > EMA(RSI, 10)")
+pdf.bullet("SHORT engellenir: RSI < 35 VE RSI < EMA(RSI, 10)")
+pdf.sub_title("Not:")
+pdf.body_text("Filtreler sadece canli taramada uygulanir. Backfill sirasinda uygulanmaz.")
+pdf.ln(2)
+
+# 8. CONFIG
+pdf.section_title("8. Yapilandirma")
+pdf.code_block(
+    "Borsa: Binance USDT-M Futures\n"
+    "Timeframe: 3m\n"
+    "Kaldirac: 10x (ayarlanabilir)\n"
+    "Margin/trade: 100 USDT (ayarlanabilir)\n"
+    "Max DCA: 2 (dalga basina)\n"
+    "TP boyutu: %20 (pozisyonun)\n"
+    "Hedge mode: Kapali\n"
+    "Max drawdown: %40\n"
+    "Max open positions: 10"
+)
+pdf.ln(2)
+
+# 9. ARCHITECTURE
+pdf.section_title("9. Teknik Mimari")
+pdf.code_block(
+    "core/strategy/indicators.py  -> PMax + Keltner Channel hesaplama\n"
+    "core/strategy/signals.py     -> PMax crossover sinyal algilama\n"
+    "core/strategy/risk_manager.py-> Keltner DCA/TP state yonetimi\n"
     "core/engine/simulator.py     -> Dry-run simulasyon motoru\n"
-    "core/engine/pair_manager.py  -> WS + candle yonetimi\n"
     "core/engine/backtester.py    -> Gecmis veri backtest motoru\n"
     "core/engine/live_executor.py -> Canli Binance islem motoru\n"
     "backend/server.py            -> FastAPI REST API\n"
-    "frontend/                    -> React + Vite dashboard"
+    "frontend/                    -> React + Vite dashboard\n"
+    "optimize.py                  -> Optuna parametre optimizasyonu"
 )
-
 pdf.sub_title("Veri Akisi:")
 pdf.code_block(
-    "Binance WS (3m kline stream)\n"
+    "Binance WS (3m kline)\n"
     "    |\n"
     "    v\n"
-    "PairManager (candle buffer)\n"
+    "PMax crossover algilama\n"
     "    |\n"
     "    v\n"
-    "SignalEngine.process() (PMax crossover algilama)\n"
+    "Keltner Channel bant hesaplama\n"
     "    |\n"
     "    v\n"
-    "Simulator.process_signal() (pozisyon ac/kapat)\n"
+    "DCA limit @ KC Lower | TP limit @ KC Upper\n"
     "    |\n"
     "    v\n"
-    "FastAPI /api/status (frontend e PnL gonder)"
+    "Simulator / LiveExecutor (pozisyon yonetimi)\n"
+    "    |\n"
+    "    v\n"
+    "FastAPI -> React Dashboard (canli PnL + grafik)"
 )
 pdf.ln(2)
 
-# 8. DRY-RUN FLOW
-pdf.section_title("8. Dry-Run Baslangic Akisi")
-pdf.body_text("Bot baslatildiginda su adimlar izlenir:")
-pdf.bullet("1. Her sembol icin 3m timeframe den son 1500 mum cekilir")
-pdf.bullet("2. process_backfill() ile tum crossover gecmisi taranir")
-pdf.bullet("3. Son aktif crossover bulunur (orn: 12 saat once LONG)")
-pdf.bullet("4. Bu pozisyon ACIK olarak simulatore yuklenir")
-pdf.bullet("5. Filtreler backfill sirasinda UYGULANMAZ")
+# 10. DRY-RUN
+pdf.section_title("10. Dry-Run Akisi")
+pdf.bullet("1. PMax backfill ile son crossover bulunur")
+pdf.bullet("2. Pozisyon ACIK olarak simulatore yuklenir")
+pdf.bullet("3. Entry den bu ana kadar tum mumlar replay edilir")
+pdf.bullet("4. Her mumda Keltner DCA/TP kontrol edilir")
+pdf.bullet("5. Fill olan DCA/TP ler islem gecmisine kaydedilir")
 pdf.bullet("6. WS baglantisi kurulur, canli fiyat akisi baslar")
-pdf.bullet("7. Scanner loop her 3m mum kapanisinda yeni crossover arar")
-pdf.bullet("8. Yeni crossover varsa reversal yapilir (eski kapanir, yenisi acilir)")
+pdf.bullet("7. Her 3m mum kapanisinda yeni Keltner degerleri hesaplanir")
+pdf.bullet("8. Limit emirler yeni bant degerlerine tasinir")
 
 # Save
-output_path = "PMax_Strategy_Documentation.pdf"
+output_path = "PMax_Keltner_Strategy.pdf"
 pdf.output(output_path)
 print(f"PDF created: {output_path}")

@@ -172,14 +172,11 @@ def _signal_scanner_loop() -> None:
                     engine = SignalEngine(cfg, tf_config=tf_cfg)
                     signal = engine.process(df)
 
-                    # DCA/TP check on last closed candle
+                    # Keltner DCA/TP check — needs full DataFrame
                     with _sim_lock:
                         if sim.has_position(sym, tf_label):
-                            candle_high = float(last_closed["high"])
-                            candle_low = float(last_closed["low"])
-                            close_time_val = int(last_closed.get("close_time", 0))
-                            exit_trades = sim.process_candle(
-                                sym, candle_high, candle_low, close_time_val, tf_label=tf_label,
+                            exit_trades = sim.process_candle_with_df(
+                                sym, df, tf_label=tf_label,
                             )
                             for t in exit_trades:
                                 state["signal_log"].append({
