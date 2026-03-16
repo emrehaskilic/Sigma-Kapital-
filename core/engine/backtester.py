@@ -21,7 +21,7 @@ import numpy as np
 import pandas as pd
 
 from core.engine.simulator import Simulator, Trade
-from core.strategy.indicators import atr, pmax, rsi, variant
+from core.strategy.indicators import adaptive_pmax, atr, pmax, rsi, variant
 from core.strategy.signals import Signal, SignalEngine
 
 logger = logging.getLogger(__name__)
@@ -245,7 +245,12 @@ class Backtester:
         signals: dict[int, Signal] = {}
 
         cfg = self.config["strategy"]
-        pmax_cfg = cfg.get("pmax", {})
+        # Get PMax config from first timeframe or top-level
+        tf_configs = cfg.get("timeframes", [])
+        if tf_configs:
+            pmax_cfg = tf_configs[0].get("pmax", cfg.get("pmax", {}))
+        else:
+            pmax_cfg = cfg.get("pmax", {})
         trade_type = self.config["trading"]["trade_type"]
 
         close = df["close"]
@@ -270,15 +275,21 @@ class Backtester:
         rsi_series = rsi(close, 28)
         atr_series = atr(high, low, close, 50)
 
-        pmax_line, mavg, direction = pmax(
-            src, high, low, close,
-            atr_period=pmax_cfg.get("atr_period", 10),
-            atr_multiplier=pmax_cfg.get("atr_multiplier", 3.0),
-            ma_type=pmax_cfg.get("ma_type", "EMA"),
-            ma_length=pmax_cfg.get("ma_length", 10),
-            change_atr=pmax_cfg.get("change_atr", True),
-            normalize_atr=pmax_cfg.get("normalize_atr", False),
-        )
+        # Use adaptive or static PMax
+        if pmax_cfg.get("adaptive", False):
+            pmax_line, mavg, direction = adaptive_pmax(
+                src, high, low, close, pmax_cfg,
+            )
+        else:
+            pmax_line, mavg, direction = pmax(
+                src, high, low, close,
+                atr_period=pmax_cfg.get("atr_period", 10),
+                atr_multiplier=pmax_cfg.get("atr_multiplier", 3.0),
+                ma_type=pmax_cfg.get("ma_type", "EMA"),
+                ma_length=pmax_cfg.get("ma_length", 10),
+                change_atr=pmax_cfg.get("change_atr", True),
+                normalize_atr=pmax_cfg.get("normalize_atr", False),
+            )
 
         pmax_vals = pmax_line.values
         mavg_vals = mavg.values

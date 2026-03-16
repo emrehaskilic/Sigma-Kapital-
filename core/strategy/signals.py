@@ -15,6 +15,7 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 from core.strategy.indicators import (
+    adaptive_pmax,
     atr,
     ema,
     pmax,
@@ -58,6 +59,8 @@ class SignalEngine:
 
         # PMax settings (from tf_config or top-level)
         pmax_cfg = tf_config.get("pmax", self._cfg.get("pmax", {}))
+        self._pmax_cfg = pmax_cfg  # store full config for adaptive mode
+        self._pmax_adaptive = pmax_cfg.get("adaptive", False)
         self._pmax_source = pmax_cfg.get("source", "hl2")
         self._atr_period = pmax_cfg.get("atr_period", 10)
         self._atr_multiplier = pmax_cfg.get("atr_multiplier", 3.0)
@@ -111,16 +114,21 @@ class SignalEngine:
         symbol = str(last.get("symbol", ""))
         base_close = float(last["close"])
 
-        # --- Compute PMax ---
-        pmax_line, mavg, direction = pmax(
-            src, high, low, close,
-            atr_period=self._atr_period,
-            atr_multiplier=self._atr_multiplier,
-            ma_type=self._ma_type,
-            ma_length=self._ma_length,
-            change_atr=self._change_atr,
-            normalize_atr=self._normalize_atr,
-        )
+        # --- Compute PMax (static or adaptive) ---
+        if self._pmax_adaptive:
+            pmax_line, mavg, direction = adaptive_pmax(
+                src, high, low, close, self._pmax_cfg,
+            )
+        else:
+            pmax_line, mavg, direction = pmax(
+                src, high, low, close,
+                atr_period=self._atr_period,
+                atr_multiplier=self._atr_multiplier,
+                ma_type=self._ma_type,
+                ma_length=self._ma_length,
+                change_atr=self._change_atr,
+                normalize_atr=self._normalize_atr,
+            )
 
         pmax_vals = pmax_line.values
         mavg_vals = mavg.values
@@ -215,16 +223,21 @@ class SignalEngine:
         last = df.iloc[-1]
         symbol = str(last.get("symbol", ""))
 
-        # --- Compute PMax ---
-        pmax_line, mavg, direction = pmax(
-            src, high, low, close,
-            atr_period=self._atr_period,
-            atr_multiplier=self._atr_multiplier,
-            ma_type=self._ma_type,
-            ma_length=self._ma_length,
-            change_atr=self._change_atr,
-            normalize_atr=self._normalize_atr,
-        )
+        # --- Compute PMax (static or adaptive) ---
+        if self._pmax_adaptive:
+            pmax_line, mavg, direction = adaptive_pmax(
+                src, high, low, close, self._pmax_cfg,
+            )
+        else:
+            pmax_line, mavg, direction = pmax(
+                src, high, low, close,
+                atr_period=self._atr_period,
+                atr_multiplier=self._atr_multiplier,
+                ma_type=self._ma_type,
+                ma_length=self._ma_length,
+                change_atr=self._change_atr,
+                normalize_atr=self._normalize_atr,
+            )
 
         pmax_vals = pmax_line.values
         mavg_vals = mavg.values

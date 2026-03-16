@@ -1,9 +1,15 @@
-"""Dry-run simulation — Keltner Channel DCA + TP.
+"""Dry-run simulation — Keltner Channel DCA + TP + Dynamic Compounding.
 
 PMax = macro trend. Keltner Channels = micro DCA/TP levels.
   LONG:  Limit BUY @ KC Lower (DCA)  |  Limit SELL @ KC Upper (TP)
   SHORT: Limit SELL @ KC Upper (DCA) |  Limit BUY @ KC Lower (TP)
 All DCA/TP = maker fee. Entry + kill switch = taker fee.
+
+Dynamic Compounding:
+  step_margin = balance * comp_pct / 100
+  comp_pct determined by balance tier (10%/10%/5%/2%)
+
+Hard Stop: 5x ATR(11) from average entry — emergency exit (taker fee).
 """
 
 from __future__ import annotations
@@ -16,9 +22,11 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from core.strategy.risk_manager import PositionState, RiskManager, MAX_DCA_STEPS
+from core.strategy.risk_manager import (
+    PositionState, RiskManager, get_dynamic_comp_pct, calc_step_margin,
+)
 from core.strategy.signals import Signal
-from core.strategy.indicators import keltner_channel
+from core.strategy.indicators import atr as atr_indicator, keltner_channel
 
 logger = logging.getLogger(__name__)
 
@@ -56,10 +64,11 @@ class Wallet:
     total_fees: float = 0.0
     maker_fees: float = 0.0
     taker_fees: float = 0.0
+    peak_balance: float = 0.0
 
 
 class Simulator:
-    """Keltner Channel DCA + TP dry-run simulator."""
+    """Keltner Channel DCA + TP dry-run simulator with Dynamic Compounding."""
 
     def __init__(self, config: dict) -> None:
         trading = config["trading"]
@@ -69,21 +78,40 @@ class Simulator:
         # Keltner settings
         tf_configs = config["strategy"].get("timeframes", [])
         kc_cfg = tf_configs[0].get("keltner", {}) if tf_configs else {}
-        self._kc_length = kc_cfg.get("length", 20)
-        self._kc_multiplier = kc_cfg.get("multiplier", 1.5)
-        self._kc_atr_period = kc_cfg.get("atr_period", 10)
+        self._kc_length = kc_cfg.get("length", 16)
+        self._kc_multiplier = kc_cfg.get("multiplier", 1.3)
+        self._kc_atr_period = kc_cfg.get("atr_period", 13)
 
         maker = trading.get("maker_fee", 0.0002)
         taker = trading.get("taker_fee", 0.0005)
+        initial = trading["initial_balance"]
 
         self.wallet = Wallet(
-            initial_balance=trading["initial_balance"],
-            balance=trading["initial_balance"],
+            initial_balance=initial,
+            balance=initial,
             leverage=trading["leverage"],
             margin_per_trade=trading["margin_per_trade"],
             maker_fee=maker,
             taker_fee=taker,
+            peak_balance=initial,
         )
+
+        # Dynamic compounding config
+        strategy = config.get("strategy", {})
+        dyncomp = strategy.get("dynamic_comp", {})
+        self._dyncomp_enabled = dyncomp.get("enabled", False)
+        self._dyncomp_tiers = dyncomp.get("tiers", [])
+
+        # Hard stop config (emergency backup)
+        hard_stop_cfg = trading.get("hard_stop", {})
+        self._hard_stop_enabled = hard_stop_cfg.get("enabled", False)
+        self._hard_stop_atr_period = hard_stop_cfg.get("atr_period", 11)
+
+        # Dynamic SL config (close-based, primary stop)
+        dyn_sl_cfg = trading.get("dynamic_sl", {})
+        self._dyn_sl_enabled = dyn_sl_cfg.get("enabled", False)
+        self._dyn_sl_atr_period = dyn_sl_cfg.get("atr_period", 12)
+
         self._positions: dict[str, PositionState] = {}
         self._size_multipliers: dict[str, float] = {}
         self._tf_labels: dict[str, str] = {}
@@ -95,7 +123,12 @@ class Simulator:
     def _pos_key(symbol: str, tf_label: str) -> str:
         return f"{symbol}:{tf_label}" if tf_label else symbol
 
-    def _get_margin(self, size_multiplier: float) -> float:
+    def _get_step_margin(self, size_multiplier: float) -> float:
+        """Get margin per step — dynamic comp or fixed."""
+        if self._dyncomp_enabled and self._dyncomp_tiers:
+            comp_pct = get_dynamic_comp_pct(self.wallet.balance, self._dyncomp_tiers)
+            margin = calc_step_margin(self.wallet.balance, comp_pct)
+            return margin * size_multiplier
         return self.wallet.margin_per_trade * size_multiplier
 
     @property
@@ -129,10 +162,12 @@ class Simulator:
                 return closed_trades
             # KILL SWITCH
             closed_trades.extend(
-                self._close_position(key, signal.price, exit_time=entry_time or signal.timestamp)
+                self._close_position(key, signal.price, exit_time=entry_time or signal.timestamp,
+                                     reason="REVERSAL_CLOSE")
             )
 
-        margin = self._get_margin(size_mult)
+        # Dynamic compounding: calculate step margin based on current balance
+        margin = self._get_step_margin(size_mult)
         if self.wallet.balance < margin:
             return closed_trades
 
@@ -155,8 +190,9 @@ class Simulator:
 
         return closed_trades
 
-    def _close_position(self, key: str, exit_price: float, exit_time: int = 0) -> list[Trade]:
-        """KILL SWITCH — market close (taker fee)."""
+    def _close_position(self, key: str, exit_price: float, exit_time: int = 0,
+                        reason: str = "REVERSAL") -> list[Trade]:
+        """Close position — market close (taker fee)."""
         if key not in self._positions or self._positions[key].condition == 0.0:
             return []
 
@@ -185,11 +221,15 @@ class Simulator:
         else:
             self.wallet.losing_trades += 1
 
+        # Track peak balance
+        if self.wallet.balance > self.wallet.peak_balance:
+            self.wallet.peak_balance = self.wallet.balance
+
         trade = Trade(
             id=self._trade_counter, symbol=pos.symbol, side=pos.side,
             entry_price=pos.average_entry_price, entry_time=pos.entry_time,
             exit_price=exit_price, exit_time=exit_time or int(time.time() * 1000),
-            exit_reason="REVERSAL", qty_usdt=round(notional, 2),
+            exit_reason=reason, qty_usdt=round(notional, 2),
             leverage=pos.leverage, pnl_usdt=round(pnl_usdt, 4),
             pnl_percent=round(pnl_pct, 4), fee_usdt=round(exit_fee, 4),
             tf_label=tf_label,
@@ -204,11 +244,12 @@ class Simulator:
                                 tf_label: str = "") -> list[Trade]:
         """Process one candle using full DataFrame for Keltner calculation.
 
-        Simulates limit orders at KC bands:
+        Simulates limit orders at KC bands + hard stop check:
         - DCA limit at KC Lower (LONG) / KC Upper (SHORT)
         - TP limit at KC Upper (LONG) / KC Lower (SHORT)
+        - Hard stop at 5x ATR from avg entry
         - Fill = candle H/L touched the band
-        - Fee = maker (Post-Only / GTX)
+        - Fee = maker (Post-Only / GTX) for DCA/TP, taker for hard stop
         """
         key = self._pos_key(symbol, tf_label)
         if key not in self._positions or self._positions[key].condition == 0.0:
@@ -220,7 +261,33 @@ class Simulator:
         if len(df) < max(self._kc_length, self._kc_atr_period) + 1:
             return []
 
-        # Calculate Keltner Channel
+        candle_high = float(df["high"].iloc[-1])
+        candle_low = float(df["low"].iloc[-1])
+        candle_close = float(df["close"].iloc[-1])
+        close_time = int(df["open_time"].iloc[-1])
+
+        # --- Dynamic SL Check (close-based, BEFORE hard stop) ---
+        if self._dyn_sl_enabled and len(df) > self._dyn_sl_atr_period:
+            dyn_atr_series = atr_indicator(df["high"], df["low"], df["close"],
+                                           self._dyn_sl_atr_period)
+            dyn_atr_val = float(dyn_atr_series.iloc[-1])
+            if not np.isnan(dyn_atr_val) and dyn_atr_val > 0:
+                dyn_hit, dyn_price = self._risk_mgr.check_dynamic_sl(
+                    pos, candle_close, dyn_atr_val,
+                )
+                if dyn_hit:
+                    return self._close_position(key, dyn_price, exit_time=close_time,
+                                                reason="DYN_SL")
+
+        # --- Hard Stop Check (emergency backup, H/L based) ---
+        stop_hit, stop_price, stop_reason = self._risk_mgr.check_hard_stop(
+            pos, candle_high, candle_low,
+        )
+        if stop_hit:
+            return self._close_position(key, stop_price, exit_time=close_time,
+                                        reason=stop_reason)
+
+        # --- Keltner Channel ---
         kc_mid, kc_upper, kc_lower = keltner_channel(
             df["high"], df["low"], df["close"],
             kc_length=self._kc_length,
@@ -232,11 +299,6 @@ class Simulator:
         lower_val = kc_lower.iloc[-1]
         if np.isnan(upper_val) or np.isnan(lower_val):
             return []
-
-        candle_high = float(df["high"].iloc[-1])
-        candle_low = float(df["low"].iloc[-1])
-        candle_close = float(df["close"].iloc[-1])
-        close_time = int(df["open_time"].iloc[-1])
 
         # Update pending order prices (for display)
         if pos.side == "LONG":
@@ -254,8 +316,24 @@ class Simulator:
         completed: list[Trade] = []
 
         if action == "DCA":
+            # DCA uses dynamic compounding for step size
+            size_mult = self._size_multipliers.get(key, 1.0)
+            dca_margin = self._get_step_margin(size_mult)
+
+            # Update step margin for this DCA
+            pos.margin_per_step = dca_margin
+
             self._risk_mgr.process_dca_fill(pos, fill_price)
-            step_notional = pos.margin_per_step * pos.leverage
+
+            # Recalculate hard stop with current ATR
+            if self._hard_stop_enabled and len(df) > self._hard_stop_atr_period:
+                atr_series = atr_indicator(df["high"], df["low"], df["close"],
+                                           self._hard_stop_atr_period)
+                current_atr = float(atr_series.iloc[-1])
+                if not np.isnan(current_atr):
+                    self._risk_mgr.update_hard_stop(pos, current_atr)
+
+            step_notional = dca_margin * self.wallet.leverage
             dca_fee = step_notional * self.wallet.maker_fee  # limit = maker
             self.wallet.balance -= dca_fee
             self.wallet.total_fees += dca_fee
@@ -294,6 +372,10 @@ class Simulator:
                 else:
                     self.wallet.losing_trades += 1
 
+                # Track peak balance
+                if self.wallet.balance > self.wallet.peak_balance:
+                    self.wallet.peak_balance = self.wallet.balance
+
                 trade = Trade(
                     id=self._trade_counter, symbol=pos.symbol, side=pos.side,
                     entry_price=avg_before, entry_time=pos.entry_time,
@@ -318,9 +400,18 @@ class Simulator:
             self.wallet.winning_trades / self.wallet.total_trades * 100
             if self.wallet.total_trades > 0 else 0
         )
+
+        # Dynamic comp info
+        comp_pct = 0
+        step_margin = 0
+        if self._dyncomp_enabled:
+            comp_pct = get_dynamic_comp_pct(self.wallet.balance, self._dyncomp_tiers)
+            step_margin = calc_step_margin(self.wallet.balance, comp_pct)
+
         return {
             "initial_balance": self.wallet.initial_balance,
             "current_balance": round(self.wallet.balance, 2),
+            "peak_balance": round(self.wallet.peak_balance, 2),
             "total_pnl": round(self.wallet.total_pnl, 2),
             "total_pnl_pct": round(
                 (self.wallet.balance - self.wallet.initial_balance)
@@ -334,4 +425,6 @@ class Simulator:
             "maker_fees": round(self.wallet.maker_fees, 4),
             "taker_fees": round(self.wallet.taker_fees, 4),
             "leverage": self.wallet.leverage,
+            "dynamic_comp_pct": comp_pct,
+            "current_step_margin": round(step_margin, 2),
         }

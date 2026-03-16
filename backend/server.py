@@ -699,8 +699,8 @@ def get_chart_data(symbol: str = "BTCUSDT", limit: int = 500):
     df = pd.DataFrame(klines)
     df["symbol"] = symbol
 
-    # Compute PMax
-    from core.strategy.indicators import pmax as calc_pmax
+    # Compute PMax (adaptive or static)
+    from core.strategy.indicators import pmax as calc_pmax, adaptive_pmax as calc_adaptive_pmax
     pmax_cfg = tf_cfg.get("pmax", {})
     src_type = pmax_cfg.get("source", "hl2").lower()
     if src_type == "hl2":
@@ -712,15 +712,20 @@ def get_chart_data(symbol: str = "BTCUSDT", limit: int = 500):
     else:
         src = df["close"]
 
-    pmax_line, mavg, direction = calc_pmax(
-        src, df["high"], df["low"], df["close"],
-        atr_period=pmax_cfg.get("atr_period", 10),
-        atr_multiplier=pmax_cfg.get("atr_multiplier", 3.0),
-        ma_type=pmax_cfg.get("ma_type", "EMA"),
-        ma_length=pmax_cfg.get("ma_length", 10),
-        change_atr=pmax_cfg.get("change_atr", True),
-        normalize_atr=pmax_cfg.get("normalize_atr", False),
-    )
+    if pmax_cfg.get("adaptive", False):
+        pmax_line, mavg, direction = calc_adaptive_pmax(
+            src, df["high"], df["low"], df["close"], pmax_cfg,
+        )
+    else:
+        pmax_line, mavg, direction = calc_pmax(
+            src, df["high"], df["low"], df["close"],
+            atr_period=pmax_cfg.get("atr_period", 10),
+            atr_multiplier=pmax_cfg.get("atr_multiplier", 3.0),
+            ma_type=pmax_cfg.get("ma_type", "EMA"),
+            ma_length=pmax_cfg.get("ma_length", 10),
+            change_atr=pmax_cfg.get("change_atr", True),
+            normalize_atr=pmax_cfg.get("normalize_atr", False),
+        )
 
     # Compute Keltner Channel
     from core.strategy.indicators import keltner_channel as calc_kc
@@ -1098,8 +1103,16 @@ def _live_signal_scanner_loop() -> None:
                     if executor.has_position(sym):
                         candle_high = float(last_closed["high"])
                         candle_low = float(last_closed["low"])
+                        candle_close = float(last_closed["close"])
                         close_time = int(last_closed.get("close_time", 0))
-                        exit_trades = executor.process_candle(sym, candle_high, candle_low, close_time)
+                        # Calculate current ATR for DynSL
+                        from core.strategy.indicators import atr as atr_indicator
+                        dyn_sl_period = cfg["trading"].get("dynamic_sl", {}).get("atr_period", 12)
+                        _current_atr = 0.0
+                        if len(df) > dyn_sl_period:
+                            _atr_s = atr_indicator(df["high"], df["low"], df["close"], dyn_sl_period)
+                            _current_atr = float(_atr_s.iloc[-1]) if not pd.isna(_atr_s.iloc[-1]) else 0.0
+                        exit_trades = executor.process_candle(sym, candle_high, candle_low, close_time, candle_close=candle_close, current_atr=_current_atr)
                         for t in exit_trades:
                             _live_state["signal_log"].append({
                                 "time": time.strftime("%H:%M:%S"),

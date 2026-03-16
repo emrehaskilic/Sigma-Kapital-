@@ -190,68 +190,20 @@ export default function App() {
               </div>
             </div>
 
-            {/* ── Dual Timeframe PMax Configs ── */}
-            {config.strategy.timeframes.map((tf, idx) => (
-              <div key={tf.label} className="bg-[#0b1217]/60 rounded-lg p-3 space-y-2">
-                <div className="flex items-center gap-2 mb-1">
-                  <h2 className="text-[10px] font-semibold text-sky-400/70 uppercase tracking-wider">
-                    PMax — {tf.label}
-                  </h2>
-                  <span className="text-[9px] px-1.5 py-0.5 rounded bg-sky-500/10 text-sky-400 font-mono">
-                    x{tf.size_multiplier} size
-                  </span>
-                </div>
-
-                {/* PMax Parameters */}
-                <div className="grid grid-cols-3 md:grid-cols-6 gap-2 text-xs">
-                  <label className="space-y-0.5">
-                    <span className="text-slate-500 text-[10px] uppercase">MA Type</span>
-                    <select value={tf.pmax.ma_type}
-                      onChange={(e) => handleTfChange(idx, "pmax", "ma_type", e.target.value)}
-                      className="w-full bg-[#0b1217] border border-slate-700/30 rounded-lg px-2 py-1 text-sm text-slate-200">
-                      {["SMA","EMA","WMA","TMA","VAR","WWMA","ZLEMA","TSF"].map(t => <option key={t} value={t}>{t}</option>)}
-                    </select>
-                  </label>
-                  <label className="space-y-0.5">
-                    <span className="text-slate-500 text-[10px] uppercase">MA Length</span>
-                    <input type="number" step="1" min="1"
-                      value={tf.pmax.ma_length}
-                      onChange={(e) => handleTfChange(idx, "pmax", "ma_length", +e.target.value)}
-                      className="w-full bg-[#0b1217] border border-slate-700/30 rounded-lg px-2 py-1 text-sm font-mono text-slate-200" />
-                  </label>
-                  <label className="space-y-0.5">
-                    <span className="text-slate-500 text-[10px] uppercase">ATR Period</span>
-                    <input type="number" step="1" min="1"
-                      value={tf.pmax.atr_period}
-                      onChange={(e) => handleTfChange(idx, "pmax", "atr_period", +e.target.value)}
-                      className="w-full bg-[#0b1217] border border-slate-700/30 rounded-lg px-2 py-1 text-sm font-mono text-slate-200" />
-                  </label>
-                  <label className="space-y-0.5">
-                    <span className="text-slate-500 text-[10px] uppercase">ATR Multiplier</span>
-                    <input type="number" step="0.1" min="0.1"
-                      value={tf.pmax.atr_multiplier}
-                      onChange={(e) => handleTfChange(idx, "pmax", "atr_multiplier", +e.target.value)}
-                      className="w-full bg-[#0b1217] border border-slate-700/30 rounded-lg px-2 py-1 text-sm font-mono text-slate-200" />
-                  </label>
-                  <label className="space-y-0.5">
-                    <span className="text-slate-500 text-[10px] uppercase">Source</span>
-                    <select value={tf.pmax.source}
-                      onChange={(e) => handleTfChange(idx, "pmax", "source", e.target.value)}
-                      className="w-full bg-[#0b1217] border border-slate-700/30 rounded-lg px-2 py-1 text-sm text-slate-200">
-                      {["hl2","close","hlc3","ohlc4"].map(t => <option key={t} value={t}>{t}</option>)}
-                    </select>
-                  </label>
-                  <label className="space-y-0.5">
-                    <span className="text-slate-500 text-[10px] uppercase">Size Mult</span>
-                    <input type="number" step="1" min="1"
-                      value={tf.size_multiplier}
-                      onChange={(e) => handleTfChange(idx, "", "size_multiplier", +e.target.value)}
-                      className="w-full bg-[#0b1217] border border-slate-700/30 rounded-lg px-2 py-1 text-sm font-mono text-slate-200" />
-                  </label>
-                </div>
-
+            {/* ── Adaptive PMax Info (read-only) ── */}
+            <div className="bg-[#0b1217]/60 rounded-lg p-3">
+              <div className="flex items-center gap-2">
+                <h2 className="text-[10px] font-semibold text-sky-400/70 uppercase tracking-wider">
+                  Adaptive PMax — {config.strategy.timeframes[0]?.label || "3m"}
+                </h2>
+                <span className="text-[9px] px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-400 font-mono">
+                  Dinamik Parametreler
+                </span>
               </div>
-            ))}
+              <p className="text-[10px] text-slate-500 mt-1">
+                Parametreler volatiliteye gore otomatik ayarlanir (settings.yaml)
+              </p>
+            </div>
 
           </div>
         )}

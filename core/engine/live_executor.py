@@ -24,7 +24,9 @@ from enum import Enum
 from typing import Any
 
 from core.data.binance_futures import BinanceFutures
-from core.strategy.risk_manager import PositionState, RiskManager
+from core.strategy.risk_manager import (
+    PositionState, RiskManager, get_dynamic_comp_pct, calc_step_margin,
+)
 from core.strategy.signals import Signal
 
 logger = logging.getLogger("live_executor")
@@ -122,6 +124,16 @@ class LiveExecutor:
         self._maker_fee = trading.get("maker_fee", 0.0002)
         self._taker_fee = trading.get("taker_fee", 0.0005)
         self._base_margin = trading.get("margin_per_trade", 100.0)
+
+        # Dynamic compounding config
+        strategy = config.get("strategy", {})
+        dyncomp = strategy.get("dynamic_comp", {})
+        self._dyncomp_enabled = dyncomp.get("enabled", False)
+        self._dyncomp_tiers = dyncomp.get("tiers", [])
+
+        # Hard stop config
+        hard_stop_cfg = trading.get("hard_stop", {})
+        self._hard_stop_enabled = hard_stop_cfg.get("enabled", False)
 
         # ── Account Protection ──
         protection = config.get("protection", {})
@@ -454,8 +466,16 @@ class LiveExecutor:
             logger.warning("[SIGNAL] Blocked for %s [%s]: %s", symbol, tf_label, block_reason)
             return closed_trades
 
-        # Margin with size multiplier
-        margin = pc.margin * size_mult
+        # Margin: dynamic compounding or fixed
+        if self._dyncomp_enabled and self._dyncomp_tiers:
+            comp_pct = get_dynamic_comp_pct(self.balance, self._dyncomp_tiers)
+            margin = calc_step_margin(self.balance, comp_pct) * size_mult
+            logger.info(
+                "[DYNCOMP] balance=%.2f comp_pct=%.1f%% step_margin=%.2f",
+                self.balance, comp_pct, margin,
+            )
+        else:
+            margin = pc.margin * size_mult
         if self.available_balance < margin:
             logger.warning(
                 "[SIGNAL] Insufficient balance for %s [%s]: need %.2f, have %.2f",
@@ -491,9 +511,9 @@ class LiveExecutor:
         self._tf_labels[key] = tf_label
         self._last_signal_ts[key] = signal.timestamp
 
-        # Entry fee estimation
+        # Entry fee estimation (market order = taker)
         notional = qty * fill_price
-        entry_fee = notional * self._maker_fee
+        entry_fee = notional * self._taker_fee
         self.total_fees += entry_fee
 
         logger.info(
@@ -547,7 +567,7 @@ class LiveExecutor:
             pnl_pct = (pos.entry_price - fill_price) / pos.entry_price * 100
 
         pnl_usdt = notional * pnl_pct / 100
-        exit_fee = actual_qty * fill_price * self._maker_fee
+        exit_fee = actual_qty * fill_price * self._taker_fee  # market close = taker
 
         self._update_stats(pnl_usdt, exit_fee)
 
@@ -583,34 +603,47 @@ class LiveExecutor:
         return [trade]
 
     def _place_dca_orders(self, key: str, pos: PositionState) -> None:
-        """Place DCA LIMIT orders on exchange for unfilled levels."""
+        """Place DCA LIMIT order at pending KC level (if any).
+
+        In the KC-based approach, DCA price is set by pending_dca_price
+        which gets updated each candle from Keltner Channel bands.
+        """
         symbol = pos.symbol
         pc = self._pair_configs.get(symbol)
-        if not pc:
+        if not pc or pos.pending_dca_price <= 0:
             return
 
         risk_mgr = self._get_risk_mgr(self._tf_labels.get(key, ""))
-        unfilled = risk_mgr.get_unfilled_dca_levels(pos)
+        if pos.dca_fills_count >= risk_mgr._max_dca_steps:
+            return  # max DCA reached
+
+        if pos.pending_dca_order_id > 0:
+            return  # already placed
+
+        # Use dynamic comp for DCA margin
+        if self._dyncomp_enabled and self._dyncomp_tiers:
+            comp_pct = get_dynamic_comp_pct(self.balance, self._dyncomp_tiers)
+            dca_margin = calc_step_margin(self.balance, comp_pct)
+        else:
+            dca_margin = pos.margin_per_step
 
         order_side = "BUY" if pos.side == "LONG" else "SELL"
-        for dca in unfilled:
-            if dca.order_id > 0:
-                continue  # already placed
-            qty = self._client.calc_quantity(symbol, pos.margin_per_step, pos.leverage, dca.price)
-            if qty <= 0:
-                continue
-            try:
-                price = self._client.calc_price(symbol, dca.price)
-                result = self._client.limit_order(symbol, order_side, qty, price)
-                dca.order_id = result.get("orderId", 0)
-                logger.info("[DCA_PLACED] %s L%d %s qty=%.6f @ %.4f orderId=%s",
-                            symbol, dca.step, order_side, qty, price, dca.order_id)
-            except Exception as e:
-                logger.error("[DCA_ORDER] Failed L%d for %s: %s", dca.step, symbol, e)
+        qty = self._client.calc_quantity(symbol, dca_margin, pos.leverage, pos.pending_dca_price)
+        if qty <= 0:
+            return
+        try:
+            price = self._client.calc_price(symbol, pos.pending_dca_price)
+            result = self._client.limit_order(symbol, order_side, qty, price)
+            pos.pending_dca_order_id = result.get("orderId", 0)
+            logger.info("[DCA_PLACED] %s %s qty=%.6f @ %.4f orderId=%s",
+                        symbol, order_side, qty, price, pos.pending_dca_order_id)
+        except Exception as e:
+            logger.error("[DCA_ORDER] Failed for %s: %s", symbol, e)
 
     def _place_tp_order(self, key: str, pos: PositionState) -> None:
         """Place TP LIMIT order on exchange."""
-        if pos.tp_price <= 0 or pos.condition == 0.0:
+        tp_price = pos.pending_tp_price or pos.tp_price
+        if tp_price <= 0 or pos.condition == 0.0:
             return
 
         symbol = pos.symbol
@@ -618,19 +651,48 @@ class LiveExecutor:
         if total_qty <= 0:
             return
 
-        tp_qty = total_qty * pos.remaining_qty * 0.20
+        # Use tp_close_pct from risk manager config (default 5%)
+        risk_mgr = self._get_risk_mgr(self._tf_labels.get(key, ""))
+        tp_pct = risk_mgr._tp_close_pct
+        tp_qty = total_qty * pos.remaining_qty * tp_pct
         if tp_qty <= 0:
             return
 
         close_side = "SELL" if pos.side == "LONG" else "BUY"
         try:
-            price = self._client.calc_price(symbol, pos.tp_price)
+            price = self._client.calc_price(symbol, tp_price)
             result = self._client.limit_order(symbol, close_side, tp_qty, price, reduce_only=True)
             pos.tp_order_id = result.get("orderId", 0)
-            logger.info("[TP_PLACED] %s %s qty=%.6f @ %.4f orderId=%s",
-                        symbol, close_side, tp_qty, price, pos.tp_order_id)
+            logger.info("[TP_PLACED] %s %s qty=%.6f @ %.4f orderId=%s (%.0f%%)",
+                        symbol, close_side, tp_qty, price, pos.tp_order_id, tp_pct * 100)
         except Exception as e:
             logger.error("[TP_ORDER] Failed for %s: %s", symbol, e)
+
+    def _place_sl_order(self, symbol: str, pos: PositionState, qty: float) -> None:
+        """Place hard stop as STOP_MARKET order on exchange."""
+        if pos.hard_stop_price <= 0 or pos.condition == 0.0:
+            return
+
+        close_side = "SELL" if pos.side == "LONG" else "BUY"
+        key = None
+        for k, p in self._positions.items():
+            if p is pos:
+                key = k
+                break
+
+        try:
+            result = self._client.stop_market_order(
+                symbol, close_side, qty, pos.hard_stop_price,
+            )
+            order_id = result.get("orderId", 0)
+            if key:
+                self._sl_order_ids[key] = order_id
+            logger.info(
+                "[SL_PLACED] %s %s qty=%.6f stop=%.4f orderId=%s",
+                symbol, close_side, qty, pos.hard_stop_price, order_id,
+            )
+        except Exception as e:
+            logger.error("[SL_ORDER] Failed for %s: %s", symbol, e)
 
     def _cancel_all_grid_orders(self, key: str, pos: PositionState) -> None:
         """Cancel ALL open DCA + TP limit orders for this position (kill switch cleanup)."""
@@ -656,7 +718,8 @@ class LiveExecutor:
             pos.tp_order_id = 0
 
     def process_candle(self, symbol: str, high: float, low: float, close_time: int,
-                       tf_label: str = "") -> list[LiveTrade]:
+                       tf_label: str = "", candle_close: float = 0.0,
+                       current_atr: float = 0.0) -> list[LiveTrade]:
         """Check DCA/TP fills for active positions.
 
         In live mode, orders are on-exchange as LIMIT. This method checks
@@ -680,45 +743,105 @@ class LiveExecutor:
             pos = self._positions[key]
             risk_mgr = self._get_risk_mgr(self._tf_labels.get(key, ""))
 
-            # 1. Check DCA fills
-            dca_fills = risk_mgr.check_dca_fills(pos, high, low)
-            for dca in dca_fills:
-                entry_fee = pos.margin_per_step * pos.leverage * self._maker_fee
-                self.total_fees += entry_fee
-
-            # 2. Check TP fill
-            closed_notional, tp_fill_price = risk_mgr.check_tp_fill(pos, high, low)
-            if closed_notional > 0 and tp_fill_price > 0:
-                self._trade_counter += 1
-
-                if pos.side == "LONG":
-                    pnl_pct = (tp_fill_price - pos.average_entry_price) / pos.average_entry_price * 100
-                else:
-                    pnl_pct = (pos.average_entry_price - tp_fill_price) / pos.average_entry_price * 100
-
-                pnl_usdt = closed_notional * pnl_pct / 100
-                tp_fee = closed_notional * self._maker_fee
-
-                self._update_stats(pnl_usdt, tp_fee)
-
-                trade = LiveTrade(
-                    id=self._trade_counter,
-                    symbol=pos.symbol,
-                    side=pos.side,
-                    entry_price=pos.average_entry_price,
-                    entry_time=pos.entry_time,
-                    exit_price=tp_fill_price,
-                    exit_time=close_time,
-                    exit_reason="TP",
-                    qty=0,
-                    qty_usdt=round(closed_notional, 2),
-                    leverage=pos.leverage,
-                    pnl_usdt=round(pnl_usdt, 4),
-                    pnl_percent=round(pnl_pct, 4),
-                    fee_usdt=round(tp_fee, 4),
+            # 0a. Dynamic SL check (close-based, tighter) — uses current ATR, not entry ATR
+            atr_for_sl = current_atr if current_atr > 0 else pos.entry_atr
+            if candle_close > 0 and atr_for_sl > 0:
+                dyn_hit, dyn_price = risk_mgr.check_dynamic_sl(
+                    pos, candle_close, atr_for_sl,
                 )
-                completed.append(trade)
-                self.trades.append(trade)
+                if dyn_hit:
+                    logger.warning(
+                        "[DYN_SL] %s %s hit @ %.4f (close=%.4f)",
+                        pos.symbol, pos.side, dyn_price, candle_close,
+                    )
+                    trades = self._close_position(key, dyn_price)
+                    for t in trades:
+                        t.exit_reason = "DYN_SL"
+                    completed.extend(trades)
+                    continue
+
+            # 0b. Hard stop check (emergency backup, H/L based)
+            stop_hit, stop_price, stop_reason = risk_mgr.check_hard_stop(pos, high, low)
+            if stop_hit:
+                logger.warning(
+                    "[%s] %s %s hit @ %.4f", stop_reason, pos.symbol, pos.side, stop_price,
+                )
+                trades = self._close_position(key, stop_price)
+                for t in trades:
+                    t.exit_reason = stop_reason
+                completed.extend(trades)
+                continue
+
+            # 1. Check Keltner DCA/TP signals using candle H/L vs pending prices
+            # DCA check: candle touches pending DCA level
+            dca_filled = False
+            if pos.dca_fills_count < risk_mgr._max_dca_steps and pos.pending_dca_price > 0:
+                dca_hit = False
+                if pos.side == "LONG" and low <= pos.pending_dca_price:
+                    dca_hit = True
+                elif pos.side == "SHORT" and high >= pos.pending_dca_price:
+                    dca_hit = True
+
+                if dca_hit:
+                    # Use dynamic comp for DCA margin
+                    if self._dyncomp_enabled and self._dyncomp_tiers:
+                        comp_pct = get_dynamic_comp_pct(self.balance, self._dyncomp_tiers)
+                        dca_margin = calc_step_margin(self.balance, comp_pct)
+                    else:
+                        dca_margin = pos.margin_per_step
+                    pos.margin_per_step = dca_margin
+
+                    risk_mgr.process_dca_fill(pos, pos.pending_dca_price)
+                    # Recalculate hard stop after DCA
+                    if pos.entry_atr > 0:
+                        risk_mgr.update_hard_stop(pos, pos.entry_atr)
+                    entry_fee = dca_margin * pos.leverage * self._maker_fee
+                    self.total_fees += entry_fee
+                    dca_filled = True
+
+            # 2. TP check: candle touches pending TP level (only if DCA filled)
+            if not dca_filled and pos.dca_fills_count > 0 and pos.pending_tp_price > 0:
+                tp_hit = False
+                if pos.side == "LONG" and high >= pos.pending_tp_price:
+                    tp_hit = True
+                elif pos.side == "SHORT" and low <= pos.pending_tp_price:
+                    tp_hit = True
+
+                if tp_hit:
+                    tp_fill_price = pos.pending_tp_price
+                    avg_before = pos.average_entry_price
+                    closed_notional = risk_mgr.process_tp_fill(pos, tp_fill_price)
+                    if closed_notional > 0:
+                        self._trade_counter += 1
+
+                        if pos.side == "LONG":
+                            pnl_pct = (tp_fill_price - avg_before) / avg_before * 100
+                        else:
+                            pnl_pct = (avg_before - tp_fill_price) / avg_before * 100
+
+                        pnl_usdt = closed_notional * pnl_pct / 100
+                        tp_fee = closed_notional * self._maker_fee
+
+                        self._update_stats(pnl_usdt, tp_fee)
+
+                        trade = LiveTrade(
+                            id=self._trade_counter,
+                            symbol=pos.symbol,
+                            side=pos.side,
+                            entry_price=avg_before,
+                            entry_time=pos.entry_time,
+                            exit_price=tp_fill_price,
+                            exit_time=close_time,
+                            exit_reason="TP",
+                            qty=0,
+                            qty_usdt=round(closed_notional, 2),
+                            leverage=pos.leverage,
+                            pnl_usdt=round(pnl_usdt, 4),
+                            pnl_percent=round(pnl_pct, 4),
+                            fee_usdt=round(tp_fee, 4),
+                        )
+                        completed.append(trade)
+                        self.trades.append(trade)
 
         return completed
     def _update_stats(self, pnl_usdt: float, fee: float) -> None:
