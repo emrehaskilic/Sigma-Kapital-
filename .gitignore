@@ -31,3 +31,9 @@ Thumbs.db
 # DB
 db/*.db
 db/*.sqlite
+
+# Data cache
+data/*.parquet
+
+# Logs
+*.log

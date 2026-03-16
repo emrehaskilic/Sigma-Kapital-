@@ -269,7 +269,8 @@ def pmax(
 
 
 # =====================================================================
-# Adaptive PMax (R3) — Dynamic parameter adjustment
+# Adaptive PMax (R3) — Continuous adaptive parameter adjustment
+# Ported from claude optimizator/adaptive_pmax.py::adaptive_pmax_continuous
 # =====================================================================
 
 def adaptive_pmax(
@@ -279,14 +280,13 @@ def adaptive_pmax(
     close: pd.Series,
     pmax_cfg: dict,
 ) -> tuple[pd.Series, pd.Series, pd.Series]:
-    """Adaptive PMax — dynamically adjusts atr_multiplier, ma_length, atr_period.
+    """Adaptive PMax — continuously adjusts atr_multiplier, ma_length, atr_period.
 
-    Uses volatility ratio and flip frequency to adapt parameters:
+    Uses pre-computed MA/ATR caches for all period variants (5-24).
+    Three adaptive axes recalculated every `update_interval` bars:
       atr_multiplier = mult_base + vol_ratio * mult_scale
-      ma_length      = ma_base + trend_distance * ma_scale
+      ma_length      = ma_base + trend_dist * ma_scale
       atr_period     = atr_base + flip_count * atr_scale
-
-    Parameters recalculated every `update_interval` bars.
 
     Returns (pmax_line, mavg, direction) — same shape as pmax().
     """
@@ -300,118 +300,106 @@ def adaptive_pmax(
     atr_scale = pmax_cfg.get("atr_scale", 1.5)
     update_interval = pmax_cfg.get("update_interval", 31)
     ma_type = pmax_cfg.get("ma_type", "EMA")
-    change_atr = pmax_cfg.get("change_atr", True)
-    normalize_atr = pmax_cfg.get("normalize_atr", False)
-    source_type = pmax_cfg.get("source", "hl2")
+    base_atr_period = min(pmax_cfg.get("atr_period", 10), 20)
+    base_ma_length = pmax_cfg.get("ma_length", 10)
+    base_atr_multiplier = pmax_cfg.get("atr_multiplier", 3.0)
 
     n = len(close)
+    close_arr = close.values
 
-    # Pre-compute ATR series for vol_ratio (using a fixed mid-range period)
-    atr_for_vol = atr_rma(high, low, close, min(atr_base, 20))
-    atr_vals_np = atr_for_vol.values
+    # Base ATR for regime detection (vol_ratio)
+    base_atr = atr_rma(high, low, close, base_atr_period).values
 
-    # Pre-compute direction flips tracking
-    # We'll compute PMax in chunks with periodically updated params
+    # Pre-compute MA variants for different lengths (cache 5-24)
+    ma_cache: dict[int, np.ndarray] = {}
+    for ml in range(5, 25):
+        ma_cache[ml] = variant(ma_type, src, ml).values
 
-    # Initialize output arrays
+    # Pre-compute ATR variants for different periods (cache 5-24)
+    atr_cache: dict[int, np.ndarray] = {}
+    for ap in range(5, 25):
+        atr_cache[ap] = atr_rma(high, low, close, ap).values
+
+    # Output arrays
     pmax_line = np.full(n, np.nan)
     mavg_out = np.full(n, np.nan)
     direction = np.ones(n)
     long_stop = np.full(n, np.nan)
     short_stop = np.full(n, np.nan)
 
-    # Dynamic parameters — start with base values
-    cur_mult = mult_base
-    cur_ma_len = int(ma_base)
-    cur_atr_period = int(atr_base)
-
-    # Track flips for atr_scale
-    flip_count_history = []  # timestamps of direction flips
-
-    # We need full-length MA and ATR, but recompute periodically
-    # Strategy: compute with current params, update params every update_interval bars
-
-    last_update_bar = 0
+    mult_series = np.full(n, base_atr_multiplier)
+    ma_len_series = np.full(n, float(base_ma_length))
+    atr_p_series = np.full(n, float(base_atr_period))
 
     for i in range(1, n):
-        # --- Recalculate dynamic params every update_interval bars ---
-        if i - last_update_bar >= update_interval and i > max(vol_lookback, flip_window, cur_ma_len, cur_atr_period):
-            last_update_bar = i
-
-            # 1. Vol ratio: current ATR / median ATR over vol_lookback
-            lookback_start = max(0, i - vol_lookback)
-            atr_window = atr_vals_np[lookback_start:i+1]
-            valid_atr = atr_window[~np.isnan(atr_window)]
-            if len(valid_atr) > 10:
-                median_atr = np.median(valid_atr)
-                current_atr = atr_vals_np[i] if not np.isnan(atr_vals_np[i]) else median_atr
-                vol_ratio = current_atr / median_atr if median_atr > 0 else 1.0
-                vol_ratio = max(0.0, min(vol_ratio, 3.0))  # clamp
-            else:
-                vol_ratio = 1.0
-
-            # 2. Trend distance: how far price is from MA (normalized)
-            if not np.isnan(mavg_out[i-1]) and mavg_out[i-1] > 0:
-                trend_dist = abs(float(close.iloc[i]) - mavg_out[i-1]) / mavg_out[i-1]
-                trend_dist = min(trend_dist * 100, 5.0)  # cap at 5
-            else:
-                trend_dist = 0.0
-
-            # 3. Flip count in flip_window
-            flip_start = max(0, i - flip_window)
-            recent_flips = sum(1 for fi in flip_count_history if fi >= flip_start)
-            flip_ratio = min(recent_flips / 10.0, 3.0)  # normalize, cap
-
-            # Update dynamic params
-            cur_mult = mult_base + vol_ratio * mult_scale
-            cur_ma_len = max(5, int(round(ma_base + trend_dist * ma_scale)))
-            cur_atr_period = max(5, int(round(atr_base + flip_ratio * atr_scale)))
-
-        # --- Compute ATR for current bar ---
-        # Use pre-computed ATR (close enough for the adaptive window)
-        atr_val = atr_vals_np[i] if not np.isnan(atr_vals_np[i]) else 0.0
-
-        # --- Compute MA value for current bar ---
-        # Use EMA-style incremental update for efficiency
-        if i < cur_ma_len:
-            # Not enough bars for MA yet
-            mavg_out[i] = float(src.iloc[i])
+        # Carry forward previous adaptive params
+        if i > 1:
+            active_mult = mult_series[i - 1]
+            active_ma_len = int(ma_len_series[i - 1])
+            active_atr_p = int(atr_p_series[i - 1])
         else:
-            # Compute MA over last cur_ma_len bars
-            window = src.iloc[max(0, i - cur_ma_len + 1):i + 1]
-            if ma_type.upper() == "EMA":
-                alpha = 2.0 / (cur_ma_len + 1)
-                if np.isnan(mavg_out[i-1]):
-                    mavg_out[i] = float(window.mean())
-                else:
-                    mavg_out[i] = alpha * float(src.iloc[i]) + (1 - alpha) * mavg_out[i-1]
-            else:
-                mavg_out[i] = float(window.mean())
+            active_mult = base_atr_multiplier
+            active_ma_len = base_ma_length
+            active_atr_p = base_atr_period
 
-        mv = mavg_out[i]
-        if np.isnan(mv) or atr_val == 0:
+        # Recalculate adaptive params at update_interval
+        if i >= vol_lookback and (update_interval <= 1 or i % update_interval == 0):
+            # 1. Vol ratio -> atr_multiplier
+            window = base_atr[max(0, i - vol_lookback):i + 1]
+            valid = window[~np.isnan(window)]
+            if len(valid) > 10:
+                median_atr = np.median(valid)
+                current_atr = base_atr[i]
+                if not np.isnan(current_atr) and median_atr > 0:
+                    vol_ratio = current_atr / median_atr
+                    vol_ratio = max(0.5, min(2.0, vol_ratio))
+                    active_mult = mult_base + vol_ratio * mult_scale
+
+            # 2. Trend distance -> ma_length
+            mavg_base = ma_cache.get(base_ma_length, ma_cache[10])
+            mavg_v = mavg_base[i] if not np.isnan(mavg_base[i]) else close_arr[i]
+            c_atr = base_atr[i] if not np.isnan(base_atr[i]) else 1.0
+            trend_dist = abs(close_arr[i] - mavg_v) / c_atr if c_atr > 0 else 0
+            trend_dist = min(4.0, trend_dist)
+            active_ma_len = int(round(ma_base + trend_dist * ma_scale))
+            active_ma_len = max(5, min(24, active_ma_len))
+
+            # 3. Flip count -> atr_period
+            flip_start = max(0, i - flip_window)
+            dir_window = direction[flip_start:i]
+            flips = int(np.sum(np.diff(dir_window) != 0)) if len(dir_window) > 1 else 0
+            active_atr_p = int(round(atr_base + flips * atr_scale))
+            active_atr_p = max(5, min(24, active_atr_p))
+
+        mult_series[i] = active_mult
+        ma_len_series[i] = float(active_ma_len)
+        atr_p_series[i] = float(active_atr_p)
+
+        # Get cached MA and ATR for active params
+        mavg_arr = ma_cache.get(active_ma_len, ma_cache[10])
+        atr_arr = atr_cache.get(active_atr_p, atr_cache[10])
+
+        if np.isnan(mavg_arr[i]) or np.isnan(atr_arr[i]):
             continue
 
-        atr_component = atr_val / float(close.iloc[i]) if normalize_atr else atr_val
+        mavg_out[i] = mavg_arr[i]
 
         # Long stop (support)
-        ls = mv - cur_mult * atr_component
+        ls = mavg_arr[i] - active_mult * atr_arr[i]
         prev_ls = long_stop[i - 1] if not np.isnan(long_stop[i - 1]) else ls
-        long_stop[i] = max(ls, prev_ls) if mv > prev_ls else ls
+        long_stop[i] = max(ls, prev_ls) if mavg_arr[i] > prev_ls else ls
 
         # Short stop (resistance)
-        ss = mv + cur_mult * atr_component
+        ss = mavg_arr[i] + active_mult * atr_arr[i]
         prev_ss = short_stop[i - 1] if not np.isnan(short_stop[i - 1]) else ss
-        short_stop[i] = min(ss, prev_ss) if mv < prev_ss else ss
+        short_stop[i] = min(ss, prev_ss) if mavg_arr[i] < prev_ss else ss
 
         # Direction
         prev_dir = direction[i - 1]
-        if prev_dir == -1 and mv > short_stop[i - 1]:
+        if prev_dir == -1 and mavg_arr[i] > short_stop[i - 1]:
             direction[i] = 1
-            flip_count_history.append(i)
-        elif prev_dir == 1 and mv < long_stop[i - 1]:
+        elif prev_dir == 1 and mavg_arr[i] < long_stop[i - 1]:
             direction[i] = -1
-            flip_count_history.append(i)
         else:
             direction[i] = prev_dir
 

@@ -40,22 +40,31 @@ export async function fetchStatus() {
 
 // ── Backtest API ──
 
-export async function runBacktest(symbols: string[], lookbackDays: number, config: object) {
-  const res = await fetch(`${BASE}/api/backtest/run`, {
+export async function runBacktest(symbols: string[], lookbackDays: number, _config: object) {
+  // Use fast numpy engine instead of slow candle-by-candle backtester
+  const symbol = symbols[0] || "ETHUSDT";
+  const res = await fetch(`${BASE}/api/backtest/fast`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ symbols, lookback_days: lookbackDays, config }),
+    body: JSON.stringify({ symbol, days: lookbackDays }),
   });
   return res.json();
 }
 
 export async function fetchBacktestStatus() {
-  const res = await fetch(`${BASE}/api/backtest/status`);
-  return res.json();
+  const res = await fetch(`${BASE}/api/backtest/fast/status`);
+  const data = await res.json();
+  // Map fast status to expected format
+  return {
+    running: data.running,
+    progress: data.progress,
+    status: data.running ? "simulating" : (data.error ? "error" : (data.progress >= 100 ? "done" : "idle")),
+    error: data.error,
+  };
 }
 
 export async function fetchBacktestResults() {
-  const res = await fetch(`${BASE}/api/backtest/results`);
+  const res = await fetch(`${BASE}/api/backtest/fast/results`);
   return res.json();
 }
 

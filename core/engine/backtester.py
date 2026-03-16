@@ -147,8 +147,8 @@ class Backtester:
                 tf_label = key.rsplit(":", 1)[1] if ":" in key else ""
 
                 buffers[key].append(indexed[key]["candles"][i])
-                if len(buffers[key]) > 1000:
-                    buffers[key] = buffers[key][-800:]
+                if len(buffers[key]) > 2000:
+                    buffers[key] = buffers[key][-1500:]
 
                 if len(buffers[key]) < _MIN_CANDLES:
                     continue

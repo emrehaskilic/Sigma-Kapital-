@@ -936,6 +936,120 @@ def backtest_reset():
 
 
 # ══════════════════════════════════════════════════════════════════════
+# FAST BACKTEST — numpy array engine (seconds, not hours)
+# ══════════════════════════════════════════════════════════════════════
+
+_fast_bt_state: dict[str, Any] = {
+    "running": False,
+    "progress": 0,
+    "result": None,
+    "error": None,
+}
+
+
+def _run_fast_backtest(symbol: str, days: int, config: dict, oos_only: bool = True) -> None:
+    try:
+        from core.engine.fast_backtest import fetch_and_cache_klines, run_fast_backtest
+        import copy
+
+        # Deep copy config to avoid mutation
+        config = copy.deepcopy(config)
+
+        _fast_bt_state["progress"] = 10
+        project_root = str(Path(__file__).resolve().parent.parent)
+        cache_dir = str(Path(project_root) / "data")
+        df = fetch_and_cache_klines(symbol, "3m", days, cache_dir=cache_dir)
+        logger.info("[FAST_BT] Loaded %d bars, oos_only=%s", len(df), oos_only)
+        _fast_bt_state["progress"] = 30
+
+        # OOS only: use last 30% of data (same as optimizer)
+        if oos_only:
+            si = int(len(df) * 0.7)
+            df = df.iloc[si:].reset_index(drop=True)
+            logger.info("[FAST_BT] OOS split: %d bars", len(df))
+
+        # Log config + module source for debugging
+        from core.strategy.indicators import adaptive_pmax as _ap
+        import inspect
+        src_lines = inspect.getsource(_ap).split('\n')
+        # Check if it has ma_cache (new version) or flip_count_history (old version)
+        has_ma_cache = any('ma_cache' in l for l in src_lines)
+        has_flip_history = any('flip_count_history' in l for l in src_lines)
+        logger.info("[FAST_BT] adaptive_pmax version: ma_cache=%s flip_history=%s lines=%d",
+                    has_ma_cache, has_flip_history, len(src_lines))
+
+        t = config.get("trading", {})
+        p = config.get("strategy", {}).get("timeframes", [{}])[0].get("pmax", {})
+        logger.info("[FAST_BT] Config: bal=%.0f lev=%d hard_stop=%s dyn_sl=%s pmax_atr_period=%s ma_length=%s",
+                    t.get("initial_balance"), t.get("leverage"),
+                    t.get("hard_stop", {}).get("enabled"),
+                    t.get("dynamic_sl", {}).get("enabled"),
+                    p.get("atr_period"), p.get("ma_length"))
+
+        result = run_fast_backtest(df, config, symbol=symbol)
+        logger.info("[FAST_BT] Result: Net=%.1f%% Bal=$%.0f DD=%.1f%%",
+                    result.metrics["total_pnl_pct"], result.metrics["current_balance"],
+                    result.metrics["max_drawdown_pct"])
+        _fast_bt_state["progress"] = 100
+        _fast_bt_state["result"] = {
+            "trades": result.trades,
+            "equity_curve": result.equity_curve,
+            "drawdown_curve": result.drawdown_curve,
+            "metrics": result.metrics,
+            "per_symbol": result.per_symbol,
+        }
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        logger.error("Fast backtest failed: %s", str(e)[:200])
+        _fast_bt_state["error"] = str(e)
+    finally:
+        _fast_bt_state["running"] = False
+
+
+@app.post("/api/backtest/fast")
+def start_fast_backtest(body: dict):
+    """Start fast numpy backtest (seconds, not hours)."""
+    if _fast_bt_state["running"]:
+        return {"error": "Fast backtest already running"}
+
+    symbol = body.get("symbol", "ETHUSDT")
+    days = body.get("days", 180)
+    oos_only = body.get("oos_only", True)
+
+    _fast_bt_state["running"] = True
+    _fast_bt_state["progress"] = 0
+    _fast_bt_state["result"] = None
+    _fast_bt_state["error"] = None
+
+    thread = threading.Thread(
+        target=_run_fast_backtest,
+        args=(symbol, days, state["config"], oos_only),
+        daemon=True,
+    )
+    thread.start()
+
+    return {"status": "started", "symbol": symbol, "days": days}
+
+
+@app.get("/api/backtest/fast/status")
+def fast_backtest_status():
+    return {
+        "running": _fast_bt_state["running"],
+        "progress": _fast_bt_state["progress"],
+        "error": _fast_bt_state["error"],
+    }
+
+
+@app.get("/api/backtest/fast/results")
+def fast_backtest_results():
+    result = _fast_bt_state["result"]
+    if not result:
+        return {"status": "no_results"}
+    return result
+
+
+# ══════════════════════════════════════════════════════════════════════
 # LIVE TRADING ENDPOINTS
 # ══════════════════════════════════════════════════════════════════════
 

@@ -19,11 +19,11 @@ strategy:
       pmax:
         source: "hl2"
         adaptive: true
-        # Base parameters (static fallback)
-        atr_period: 20
-        atr_multiplier: 4.0
+        # Base parameters (used for vol_ratio calc + static fallback)
+        atr_period: 10
+        atr_multiplier: 3.0
         ma_type: "EMA"
-        ma_length: 18
+        ma_length: 10
         change_atr: true
         normalize_atr: false
         # Adaptive parameters
@@ -83,8 +83,8 @@ trading:
 
   # --- RISK ---
   hard_stop:
-    enabled: true
-    atr_multiplier: 5.0          # 5x ATR(11) — emergency backup (fixed at entry)
+    enabled: false               # DynSL handles stops — hard stop disabled (optimizer had no hard stop)
+    atr_multiplier: 5.0
     atr_period: 11
   dynamic_sl:
     enabled: true

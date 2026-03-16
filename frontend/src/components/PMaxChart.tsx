@@ -144,7 +144,7 @@ export function PMaxChart({ symbol, botRunning }: Props) {
     if (!cs || !ps) return;
 
     try {
-      const res = await fetch(`${BASE}/api/chart-data?symbol=${symbol}&limit=500`);
+      const res = await fetch(`${BASE}/api/chart-data?symbol=${symbol}&limit=1500`);
       const data: ChartDataResponse = await res.json();
       if (data.error) return;
 
@@ -202,9 +202,8 @@ export function PMaxChart({ symbol, botRunning }: Props) {
 
   useEffect(() => {
     fetchData();
-    if (botRunning) {
-      pollRef.current = window.setInterval(fetchData, 10000);
-    }
+    // Always poll — chart works even without bot running
+    pollRef.current = window.setInterval(fetchData, botRunning ? 10000 : 30000);
     return () => {
       if (pollRef.current) clearInterval(pollRef.current);
     };
